@@ -1,59 +1,31 @@
-# 只照做清单：让日报网页每天自动更新
+# 只照做清单
 
-## 第一次部署
+1. 下载并解压 `vpn_daily_dashboard_auto_v3.zip`。
+2. 打开 GitHub Desktop。
+3. 选择你的日报仓库。
+4. 点 `Repository → Show in Finder` / `Show in Explorer`。
+5. 把解压后 `vpn_daily_dashboard_auto_v3` 里面的内容复制到仓库根目录，选择覆盖。
+6. 回到 GitHub Desktop。
+7. 左下角提交信息写：
 
-1. 下载 `vpn_daily_dashboard_auto.zip`。
-2. 解压。
-3. 打开 GitHub，新建仓库，名字建议：`vpn-daily-dashboard`。
-4. 在仓库里点 `Add file` → `Upload files`。
-5. 把解压后的全部文件夹拖进去：`.github`、`config`、`docs`、`scripts`、`requirements.txt`、`README_无代码部署.md`。
-6. 点击绿色提交按钮。
-7. 打开 `Settings` → `Actions` → `General`。
-8. 找到 `Workflow permissions`，选择 `Read and write permissions`，保存。
-9. 打开 `Settings` → `Pages`。
-10. Source 选 `GitHub Actions`，保存。
-11. 打开 `Actions` → `Daily VPN Dashboard Update` → `Run workflow`。
-12. 等运行成功后，回到 `Settings` → `Pages`，复制页面地址。
+```text
+update dashboard v3 strict freshness five categories
+```
 
-## 之后会自动发生什么
+8. 点 `Commit to main`。
+9. 点 `Push origin`。
+10. 打开 GitHub 网页仓库。
+11. 进入 `Actions → Daily VPN Dashboard Update`。
+12. 点 `Run workflow`。
+13. Branch 选 `main`。
+14. 再点绿色 `Run workflow`。
+15. 等绿色对号出现。
+16. 打开你的 GitHub Pages 地址查看新版面板。
 
-每天新加坡时间 08:15 左右，GitHub 会自动：
+新版判断规则：
 
-1. 打开信息源清单。
-2. 抓取公开网页、Reddit、媒体页、应用商店等来源。
-3. 重新生成日报 JSON。
-4. 重新生成 `docs/index.html`。
-5. 直接部署到 GitHub Pages。
-6. 同时把当日归档提交回仓库。
-
-## 修改信息源
-
-改这个文件：
-
-`config/sources.csv`
-
-保存后，下一次自动任务会按新来源抓取。
-
-## 可选：让受限来源更完整
-
-进入：
-
-`Settings` → `Secrets and variables` → `Actions`
-
-可以添加：
-
-- Secret：`YOUTUBE_API_KEY`
-- Secret：`X_BEARER_TOKEN`
-- Secret：`SERPAPI_KEY`
-- Secret：`OPENAI_API_KEY`
-- Variable：`OPENAI_MODEL`
-
-不添加也能运行；只是部分来源会显示“受限”。
-
-## 手工补充私域/Discord/TikTok 线索
-
-改这个文件：
-
-`config/manual_inputs.csv`
-
-把示例行的日期改成当天日期，或者留空日期，即可被下一次日报纳入。
+- 旧信息不会进入主面板。
+- 没有发布时间的信息不会进入主面板。
+- 默认只展示最近 36 小时的信息。
+- 每个要点后都会有来源链接。
+- 多个来源反映同一件事，会合并成一个要点。

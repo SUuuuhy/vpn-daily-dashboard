@@ -1,11 +1,16 @@
 name: Daily VPN Dashboard Update
 
 on:
-  schedule:
-    # 00:15 UTC = 08:15 Asia/Singapore.
-    # GitHub Actions cron uses UTC by default.
-    - cron: "15 0 * * *"
   workflow_dispatch:
+  schedule:
+    # GitHub cron uses UTC. 00:15 UTC = 08:15 Asia/Singapore.
+    - cron: "15 0 * * *"
+  push:
+    paths:
+      - "config/**"
+      - "scripts/**"
+      - "requirements.txt"
+      - ".github/workflows/daily-update.yml"
 
 permissions:
   contents: write
@@ -13,20 +18,17 @@ permissions:
   id-token: write
 
 concurrency:
-  group: vpn-dashboard-daily-update
+  group: pages
   cancel-in-progress: false
 
 jobs:
-  update-and-deploy:
+  update-dashboard:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-
     steps:
-      - name: Check out repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -42,18 +44,38 @@ jobs:
 
       - name: Generate dashboard
         env:
-          DASHBOARD_TIMEZONE: Asia/Singapore
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}
-          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          # v3 严格时效：默认只展示最近 36 小时内且有明确发布时间/更新时间的信息。
+          DASHBOARD_LOOKBACK_HOURS: "36"
+          FRESHNESS_HOURS: "36"
+          FRESHNESS_WINDOW_HOURS: "36"
+          UNKNOWN_DATE_POLICY: "exclude"
+          # Optional but recommended for stable Reddit access.
+          REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
+          REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
+          REDDIT_USER_AGENT: ${{ secrets.REDDIT_USER_AGENT }}
+          # Optional. Required only if you want official X/Twitter account posts under 社交媒体.
           X_BEARER_TOKEN: ${{ secrets.X_BEARER_TOKEN }}
-          SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
+          # Optional. Required only if you want YouTube sources with accurate publishedAt.
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          DASHBOARD_USER_AGENT: ${{ secrets.DASHBOARD_USER_AGENT }}
         run: python scripts/update_dashboard.py
+
+      - name: Commit generated dashboard files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs
+          if git diff --cached --quiet; then
+            echo "No generated changes to commit."
+          else
+            git commit -m "Update dashboard $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            git push
+          fi
 
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
 
-      - name: Upload GitHub Pages artifact
+      - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
           path: docs
@@ -61,15 +83,3 @@ jobs:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
-
-      - name: Commit updated dashboard archive
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add docs/index.html docs/data docs/archive docs/reports docs/status
-          if git diff --cached --quiet; then
-            echo "No dashboard changes to commit."
-          else
-            git commit -m "Daily VPN dashboard update $(date -u +'%Y-%m-%d')"
-            git push
-          fi

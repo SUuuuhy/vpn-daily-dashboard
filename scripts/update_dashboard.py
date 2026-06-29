@@ -1,1479 +1,1633 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-VPN UK 信息源观察面板：每日自动更新脚本
+VPN 信息源观察日报自动更新脚本 v3
 
-运行方式：
-    python scripts/update_dashboard.py
-
-它会：
-1. 读取 config/sources.csv 的信息源池。
-2. 按来源类型抓取公开网页、Reddit、App Store、YouTube/X/Google 的可选 API。
-3. 将原始内容按“重要性、受众关切、行业相关、增长需求点”打分。
-4. 生成 docs/index.html、docs/data/latest.json、docs/archive/YYYY-MM-DD.json。
-5. 在 GitHub Actions 中每日自动提交更新，从而让 GitHub Pages 自动刷新网页。
+本版规则按用户要求重做：
+1) 只输出与当前时间窗口一致的信息，超过窗口或无法确认发布时间的条目不会进入日报重点。
+2) 每条统一要点后都附原始来源链接；多个来源反映同一件事时合并为同一个要点。
+3) 面板仅保留 5 类：竞品动态、社交媒体、reddit讨论、政策风险、第三方网站。
+4) 移除增长/运营行动建议，只做信息观察、来源追踪和时效说明。
 """
-
 from __future__ import annotations
 
-import argparse
 import csv
 import datetime as dt
-import hashlib
+import email.utils
 import html
 import json
 import os
 import re
 import sys
 import time
-from dataclasses import dataclass
+import traceback
+from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import parse_qs, urlencode, urljoin, urlparse
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+from urllib.parse import parse_qsl, quote_plus, urlencode, urljoin, urlparse, urlunparse
+
+try:
+    import requests
+except Exception:  # pragma: no cover
+    print("requests is required. Install with: pip install -r requirements.txt", file=sys.stderr)
+    raise
+
+try:
+    from bs4 import BeautifulSoup
+except Exception:  # pragma: no cover
+    print("beautifulsoup4 is required. Install with: pip install -r requirements.txt", file=sys.stderr)
+    raise
+
+try:
+    from dateutil import parser as date_parser  # type: ignore
+except Exception:  # pragma: no cover
+    date_parser = None  # type: ignore
 
 try:
     from zoneinfo import ZoneInfo
 except Exception:  # pragma: no cover
     ZoneInfo = None  # type: ignore
 
-try:
-    import requests
-except Exception:  # pragma: no cover
-    requests = None  # type: ignore
-
-try:
-    from bs4 import BeautifulSoup
-except Exception:  # pragma: no cover
-    BeautifulSoup = None  # type: ignore
-
-try:
-    import feedparser
-except Exception:  # pragma: no cover
-    feedparser = None  # type: ignore
-
-
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG_DIR = ROOT / "config"
 DOCS_DIR = ROOT / "docs"
 DATA_DIR = DOCS_DIR / "data"
 ARCHIVE_DIR = DOCS_DIR / "archive"
-REPORTS_DIR = DOCS_DIR / "reports"
+REPORT_DIR = DOCS_DIR / "reports"
 STATUS_DIR = DOCS_DIR / "status"
 
-TZ_NAME = os.getenv("DASHBOARD_TIMEZONE", "Asia/Singapore")
-DEFAULT_HEADERS = {
-    "User-Agent": os.getenv(
-        "DASHBOARD_USER_AGENT",
-        "Mozilla/5.0 (compatible; VPNDailyDashboard/1.0; +https://github.com/)"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.8,*/*;q=0.7",
-    "Accept-Language": "en-GB,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
+SOURCES_CSV = CONFIG_DIR / "sources.csv"
+MANUAL_CSV = CONFIG_DIR / "manual_inputs.csv"
+
+def env_int(name: str, default: int) -> int:
+    value = os.getenv(name, "")
+    if value is None or str(value).strip() == "":
+        return default
+    try:
+        return int(float(str(value).strip()))
+    except Exception:
+        return default
+
+
+MAX_SOURCES_PER_RUN = env_int("MAX_SOURCES_PER_RUN", 140)
+MAX_ITEMS_PER_SOURCE = env_int("MAX_ITEMS_PER_SOURCE", 8)
+HTTP_TIMEOUT = env_int("HTTP_TIMEOUT_SECONDS", 12)
+MAX_WORKERS = env_int("MAX_WORKERS", 8)
+SKIP_NETWORK = os.getenv("SKIP_NETWORK", "").lower() in {"1", "true", "yes"}
+
+# Strict freshness window. Default is 36 hours for every category.
+# User requirement: no old baseline items in the panel; undated items are hidden by default.
+FRESHNESS_HOURS = env_int("DASHBOARD_LOOKBACK_HOURS", env_int("FRESHNESS_HOURS", env_int("FRESHNESS_WINDOW_HOURS", 36)))
+FRESHNESS_DAYS = {cat: FRESHNESS_HOURS / 24.0 for cat in ["竞品动态", "社交媒体", "reddit讨论", "政策风险", "第三方网站"]}
+UNKNOWN_DATE_POLICY = os.getenv("UNKNOWN_DATE_POLICY", "exclude").lower()  # exclude | include
+
+USER_AGENT = os.getenv(
+    "DASHBOARD_USER_AGENT",
+    "web:com.example.vpn-dashboard:v3.0 (contact: dashboard-owner) Python/requests",
+)
+REDDIT_USER_AGENT = os.getenv(
+    "REDDIT_USER_AGENT",
+    "web:com.example.vpn-dashboard:v3.0 (by /u/dashboard-owner)",
+)
+X_BEARER_TOKEN = os.getenv("X_BEARER_TOKEN", "").strip()
+
+SESSION = requests.Session()
+SESSION.headers.update(
+    {
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.8,*/*;q=0.7",
+        "Accept-Language": "en-GB,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
+    }
+)
+
+TAXONOMY: List[Dict[str, str]] = [
+    {
+        "name": "竞品动态",
+        "definition": "只放竞品官方网站、官方博客、新闻室、更新日志、状态页等竞品一手内容；用户论坛不放这里。",
+        "examples": "NordVPN/ExpressVPN/Proton VPN/Surfshark/Windscribe/Mullvad/PIA/CyberGhost 官网内容。",
+    },
+    {
+        "name": "社交媒体",
+        "definition": "只放竞品官方社交账号发布的内容。非官方讨论、泛搜索和 KOC 内容不放在这里。",
+        "examples": "竞品官方 X/Twitter、YouTube、TikTok、LinkedIn、Instagram。",
+    },
+    {
+        "name": "reddit讨论",
+        "definition": "只放 Reddit 用户发布或讨论的帖子。",
+        "examples": "r/VPN、r/nordvpn、r/ProtonVPN、r/Express_VPN 等。",
+    },
+    {
+        "name": "政策风险",
+        "definition": "只放政府、监管机构、官方政策公告与合规页面。",
+        "examples": "GOV.UK、Ofcom、ICO、欧盟/美国/英国监管机构。",
+    },
+    {
+        "name": "第三方网站",
+        "definition": "除以上四类外的媒体、评测站、搜索结果、商店评论、论坛、Trustpilot、YouTube 泛搜索等。",
+        "examples": "TechRadar、Tom’s Guide、Comparitech、Top10VPN、Google/应用商店搜索、独立论坛。",
+    },
+]
+TAXONOMY_ORDER = [x["name"] for x in TAXONOMY]
+TAXONOMY_META = {x["name"]: x for x in TAXONOMY}
+
+
+def normalize_category(value: Any) -> str:
+    text = clean_text(value)
+    mapping = {
+        "Reddit讨论": "reddit讨论",
+        "Reddit 討論": "reddit讨论",
+        "reddit": "reddit讨论",
+        "Reddit": "reddit讨论",
+        "政策监管": "政策风险",
+        "政策/监管": "政策风险",
+        "竞品官网": "竞品动态",
+        "竞品官方网站": "竞品动态",
+        "第三方": "第三方网站",
+    }
+    text = mapping.get(text, text)
+    return text if text in TAXONOMY_ORDER else ""
+
+COMPETITOR_DOMAINS = {
+    "nordvpn.com", "nordsecurity.com", "expressvpn.com", "protonvpn.com", "proton.me",
+    "surfshark.com", "windscribe.com", "blog.windscribe.com", "mullvad.net",
+    "privateinternetaccess.com", "cyberghostvpn.com", "airvpn.org", "tunnelbear.com",
+    "hide.me", "vyprvpn.com", "ivpn.net", "purevpn.com",
 }
-REQUEST_TIMEOUT = float(os.getenv("DASHBOARD_TIMEOUT", "20"))
-MAX_ITEMS_PER_SOURCE = int(os.getenv("MAX_ITEMS_PER_SOURCE", "15"))
-MAX_RAW_ITEMS = int(os.getenv("MAX_RAW_ITEMS", "240"))
+GOVERNMENT_DOMAINS = {
+    "gov.uk", "ofcom.org.uk", "ico.org.uk", "europa.eu", "ec.europa.eu", "ftc.gov",
+    "fcc.gov", "legislation.gov.uk", "parliament.uk", "congress.gov",
+}
+SOCIAL_DOMAINS = {
+    "x.com", "twitter.com", "youtube.com", "youtu.be", "tiktok.com", "instagram.com",
+    "facebook.com", "linkedin.com", "threads.net", "mastodon.social",
+}
+COMPETITOR_BRANDS = [
+    "nordvpn", "nord vpn", "expressvpn", "express vpn", "protonvpn", "proton vpn", "surfshark",
+    "windscribe", "mullvad", "private internet access", "pia", "cyberghost", "airvpn", "tunnelbear",
+    "hide.me", "vyprvpn", "ivpn", "purevpn",
+]
 
+ISSUE_RULES: List[Tuple[str, List[str]]] = [
+    ("年龄验证/未成年人政策", ["age assurance", "age verification", "age check", "under-16", "under 16", "children", "child online", "online safety", "ofcom", "ico", "年龄", "未成年人", "儿童", "青少年"]),
+    ("流媒体/平台识别", ["netflix", "iplayer", "bbc", "prime video", "disney", "streaming", "geo", "geoblock", "region", "detected", "unblock", "流媒体", "解锁", "地区", "被识别"]),
+    ("价格/续费/退款/取消", ["price", "pricing", "renewal", "refund", "cancel", "subscription", "deal", "discount", "coupon", "trial", "价格", "续费", "退款", "取消", "折扣", "优惠"]),
+    ("节点/速度/连接稳定", ["slow", "speed", "latency", "disconnect", "connection", "server", "node", "captcha", "ip reputation", "blocked", "速度", "延迟", "掉线", "节点", "连接", "验证码"]),
+    ("隐私/审计/无日志", ["privacy", "no-log", "no logs", "audit", "jurisdiction", "transparency", "webrtc", "dns leak", "leak", "wireguard", "隐私", "无日志", "审计", "透明", "泄漏", "协议"]),
+    ("产品/功能更新", ["app", "feature", "release", "update", "protocol", "android", "ios", "windows", "macos", "linux", "extension", "功能", "发布", "更新", "客户端", "协议"]),
+    ("榜单/评测/SEO", ["best vpn", "review", "comparison", "vs", "ranking", "top vpn", "guide", "榜单", "评测", "对比", "排名"]),
+    ("公共 Wi-Fi/旅行/学生", ["wifi", "wi-fi", "airport", "hotel", "travel", "student", "university", "uni", "eduroam", "5g", "公共", "机场", "酒店", "旅行", "学生", "校园"]),
+    ("免费版/入门需求", ["free vpn", "free", "freemium", "免费", "试用", "入门"]),
+]
 
-@dataclass
-class FetchResult:
-    source_name: str
-    platform: str
-    url: str
-    status: str
-    item_count: int = 0
-    note: str = ""
-    elapsed_ms: int = 0
+SUBCATEGORY_RULES: Dict[str, List[Tuple[str, List[str]]]] = {
+    "竞品动态": [
+        ("产品/功能更新", ["release", "update", "feature", "app", "protocol", "server", "extension", "download", "功能", "版本", "发布", "协议"]),
+        ("安全/隐私/审计", ["privacy", "audit", "security", "no-log", "transparency", "漏洞", "隐私", "审计", "安全"]),
+        ("研究/报告/新闻室", ["research", "report", "survey", "press", "newsroom", "study", "研究", "报告", "新闻"]),
+        ("营销/合作/奖项", ["award", "partner", "sponsor", "campaign", "discount", "合作", "奖项", "营销"]),
+    ],
+    "社交媒体": [
+        ("官方公告", ["announce", "launch", "release", "update", "发布", "公告", "上线"]),
+        ("官方活动/互动", ["giveaway", "campaign", "event", "webinar", "活动", "互动", "直播"]),
+        ("官方客服回应", ["support", "issue", "fix", "outage", "客服", "修复", "故障"]),
+    ],
+    "reddit讨论": [
+        ("竞品口碑", ["nord", "express", "proton", "surfshark", "windscribe", "mullvad", "pia", "cyberghost"]),
+        ("购买/退款/续费", ["price", "refund", "cancel", "renewal", "subscription", "coupon", "deal", "价格", "退款", "续费", "取消"]),
+        ("连接/节点/速度", ["slow", "speed", "disconnect", "server", "captcha", "latency", "blocked", "速度", "节点", "掉线", "验证码"]),
+        ("使用场景", ["netflix", "streaming", "wifi", "school", "uni", "travel", "流媒体", "校园", "旅行", "公共"]),
+        ("隐私/安全", ["privacy", "logs", "audit", "leak", "wireguard", "隐私", "泄漏", "协议"]),
+    ],
+    "政策风险": [
+        ("年龄验证/未成年人", ["age", "children", "child", "under-16", "online safety", "ofcom", "ico", "年龄", "儿童", "未成年人"]),
+        ("网络安全/隐私监管", ["privacy", "data protection", "security", "enforcement", "gdpr", "隐私", "数据保护", "执法"]),
+        ("立法/监管时间表", ["act", "bill", "roadmap", "guidance", "consultation", "deadline", "法案", "路线图", "指南", "咨询"]),
+    ],
+    "第三方网站": [
+        ("媒体评测/榜单", ["best vpn", "review", "comparison", "ranking", "tom", "techradar", "comparitech", "榜单", "评测", "对比"]),
+        ("X-VPN 外部评测", ["x-vpn", "xvpn", "top10vpn"]),
+        ("商店/口碑", ["app store", "google play", "trustpilot", "rating", "review", "应用商店", "评分", "评论"]),
+        ("论坛/问答", ["forum", "discussion", "student room", "privacyguides", "论坛", "问答"]),
+        ("开放社媒搜索/非官方", ["x 搜索", "youtube 搜索", "tiktok 搜索", "search", "搜索"]),
+    ],
+}
+
+PRIORITY_LABELS = [(86, "P0"), (74, "P1"), (60, "P2"), (0, "P3")]
+STOP_WORDS = {
+    "the", "and", "for", "with", "from", "that", "this", "are", "you", "your", "vpn", "vpns",
+    "https", "http", "www", "com", "reddit", "best", "can", "how", "what", "why", "does", "have",
+    "official", "blog", "news", "privacy",
+}
+
+_REDDIT_TOKEN: Optional[str] = None
+_REDDIT_TOKEN_EXPIRES = 0.0
 
 
 def now_sg() -> dt.datetime:
-    if ZoneInfo is None:
-        return dt.datetime.utcnow() + dt.timedelta(hours=8)
-    return dt.datetime.now(ZoneInfo(TZ_NAME))
+    if ZoneInfo:
+        return dt.datetime.now(tz=ZoneInfo("Asia/Singapore"))
+    return dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc) + dt.timedelta(hours=8)
 
 
-def ensure_dirs() -> None:
-    for p in [DATA_DIR, ARCHIVE_DIR, REPORTS_DIR, STATUS_DIR]:
-        p.mkdir(parents=True, exist_ok=True)
-
-
-def clean_text(value: Any, limit: Optional[int] = None) -> str:
+def clean_text(value: Any) -> str:
     if value is None:
         return ""
-    text = str(value)
-    text = re.sub(r"\s+", " ", text).strip()
-    if limit and len(text) > limit:
-        return text[: limit - 1].rstrip() + "…"
-    return text
+    text = html.unescape(str(value))
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
 
-def stable_id(*parts: str) -> str:
-    raw = "|".join(parts).encode("utf-8", errors="ignore")
-    return hashlib.sha1(raw).hexdigest()[:16]
-
-
-def load_sources(path: Path = CONFIG_DIR / "sources.csv") -> List[Dict[str, str]]:
+def read_csv_dicts(path: Path) -> List[Dict[str, str]]:
     if not path.exists():
-        raise FileNotFoundError(f"找不到来源配置：{path}")
+        return []
     with path.open("r", encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
         return [{k: clean_text(v) for k, v in row.items()} for row in reader]
 
 
-def load_seed() -> Dict[str, Any]:
-    p = CONFIG_DIR / "seed_dashboard.json"
-    if p.exists():
-        return json.loads(p.read_text(encoding="utf-8"))
-    return {}
-
-
-def should_fetch_source(source: Dict[str, str], today: dt.date, full_scan: bool = False) -> bool:
-    if full_scan:
-        return True
-    frequency = source.get("追踪频率", "")
-    layer = source.get("日报层级", "")
-    sustainable = source.get("是否可持续追踪", "")
-
-    # 默认每天抓取“核心日报源”，这样页面每天都会真实刷新；
-    # 月更/低频来源仍按表格节奏控制，避免不必要请求。
-    if layer == "核心日报源":
-        return True
-    if "每日" in frequency:
-        return True
-    if "每周" in frequency:
-        return today.weekday() == 0
-    if "每月" in frequency:
-        return today.day == 1
-    if "低频" in frequency:
-        return today.day == 1 and today.month in {1, 4, 7, 10}
-    return sustainable == "是" and today.weekday() == 0
-
-
-def source_priority(source: Dict[str, str]) -> int:
-    raw = source.get("监控优先级分", "")
+def safe_int(value: Any, default: int = 0) -> int:
     try:
-        return int(float(raw))
+        return int(float(clean_text(value)))
     except Exception:
-        layer = source.get("日报层级", "")
-        if layer == "核心日报源":
-            return 8
-        if layer == "周更重点源":
-            return 5
-        return 2
+        return default
 
 
-def is_http_url(value: str) -> bool:
-    return value.startswith("http://") or value.startswith("https://")
+def source_priority(row: Dict[str, str]) -> int:
+    for key in ["监控优先级分", "priority", "优先级"]:
+        if clean_text(row.get(key)):
+            return safe_int(row.get(key), 0)
+    return 0
 
 
-def request_json(url: str, params: Optional[Dict[str, Any]] = None) -> Any:
-    if requests is None:
-        raise RuntimeError("缺少 requests 依赖")
-    resp = requests.get(url, params=params, headers=DEFAULT_HEADERS, timeout=REQUEST_TIMEOUT)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def request_text(url: str) -> Tuple[str, str]:
-    if requests is None:
-        raise RuntimeError("缺少 requests 依赖")
-    resp = requests.get(url, headers=DEFAULT_HEADERS, timeout=REQUEST_TIMEOUT)
-    resp.raise_for_status()
-    return resp.text, resp.headers.get("content-type", "")
-
-
-def to_item(
-    *,
-    source: Dict[str, str],
-    title: str,
-    url: str,
-    snippet: str = "",
-    published: str = "",
-    item_type: str = "web",
-    metrics: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    title = clean_text(title, 260)
-    snippet = clean_text(snippet, 900)
-    source_name = source.get("来源名称", "")
-    source_url = source.get("URL/入口", "")
-    item_url = url or source_url
-    return {
-        "id": stable_id(source_name, item_url, title),
-        "title": title or source_name,
-        "url": item_url,
-        "source": source_name,
-        "platform": source.get("平台", ""),
-        "source_category": source.get("来源类别", ""),
-        "target_user": source.get("目标用户", ""),
-        "source_note": source.get("备注", ""),
-        "key_info": source.get("关键信息", ""),
-        "source_priority": source_priority(source),
-        "tier": source.get("日报层级", ""),
-        "published": published,
-        "snippet": snippet,
-        "type": item_type,
-        "metrics": metrics or {},
-    }
-
-
-def load_manual_items(today: dt.date) -> List[Dict[str, Any]]:
-    """Load optional human notes from config/manual_inputs.csv.
-
-    Columns: date, source, title, url, note, theme, priority.
-    Rows dated today are included. Blank date rows are always included.
-    """
-    path = CONFIG_DIR / "manual_inputs.csv"
-    if not path.exists():
-        return []
-    items: List[Dict[str, Any]] = []
-    try:
-        with path.open("r", encoding="utf-8-sig", newline="") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                row_date = clean_text(row.get("date", ""))
-                if row_date and row_date != today.strftime("%Y-%m-%d"):
-                    continue
-                source = {
-                    "来源名称": clean_text(row.get("source", "手工补充")),
-                    "平台": "Manual",
-                    "来源类别": "手工补充",
-                    "目标用户": "",
-                    "备注": clean_text(row.get("theme", "")),
-                    "关键信息": clean_text(row.get("priority", "")),
-                    "监控优先级分": "8",
-                    "日报层级": "核心日报源",
-                    "URL/入口": clean_text(row.get("url", "")),
-                }
-                title = clean_text(row.get("title", ""))
-                if not title:
-                    continue
-                items.append(
-                    to_item(
-                        source=source,
-                        title=title,
-                        url=clean_text(row.get("url", "")),
-                        snippet=clean_text(row.get("note", "")),
-                        published=row_date,
-                        item_type="manual",
-                        metrics={"priority": clean_text(row.get("priority", "")), "theme": clean_text(row.get("theme", ""))},
-                    )
-                )
-    except Exception:
-        return []
-    return items
-
-
-def fetch_reddit(source: Dict[str, str]) -> Tuple[List[Dict[str, Any]], str]:
-    url = source.get("URL/入口", "")
-    parsed = urlparse(url)
-    path = parsed.path or ""
-    match = re.search(r"/r/([^/]+)/?", path, re.I)
-    if not match:
-        return [], "未识别 subreddit"
-
-    subreddit = match.group(1)
-    query = ""
-    sort = "new"
-    if "search" in path:
-        qs = parse_qs(parsed.query)
-        query = (qs.get("q") or ["vpn"])[0]
-        sort = (qs.get("sort") or ["new"])[0]
-        endpoint = f"https://www.reddit.com/r/{subreddit}/search.json"
-        params = {"q": query or "vpn", "restrict_sr": "1", "sort": sort, "limit": MAX_ITEMS_PER_SOURCE}
-    else:
-        endpoint = f"https://www.reddit.com/r/{subreddit}/new.json"
-        params = {"limit": MAX_ITEMS_PER_SOURCE}
-
-    items: List[Dict[str, Any]] = []
-    try:
-        data = request_json(endpoint, params=params)
-        for child in data.get("data", {}).get("children", []):
-            d = child.get("data", {})
-            title = d.get("title") or ""
-            permalink = d.get("permalink") or ""
-            item_url = "https://www.reddit.com" + permalink if permalink.startswith("/") else d.get("url", url)
-            created_utc = d.get("created_utc")
-            published = ""
-            if created_utc:
-                published = dt.datetime.utcfromtimestamp(float(created_utc)).replace(tzinfo=dt.timezone.utc).isoformat()
-            snippet = d.get("selftext") or d.get("link_flair_text") or ""
-            metrics = {
-                "score": d.get("score"),
-                "comments": d.get("num_comments"),
-                "subreddit": d.get("subreddit"),
-            }
-            items.append(to_item(source=source, title=title, url=item_url, snippet=snippet, published=published, item_type="reddit", metrics=metrics))
-        return items, "Reddit JSON"
-    except Exception as exc_json:
-        # RSS fallback is useful when the JSON endpoint is rate-limited.
-        if feedparser is None:
-            return [], f"Reddit 抓取失败：{type(exc_json).__name__}"
-        try:
-            if query:
-                rss_url = f"https://www.reddit.com/r/{subreddit}/search.rss?{urlencode({'q': query, 'restrict_sr': 1, 'sort': sort})}"
-            else:
-                rss_url = f"https://www.reddit.com/r/{subreddit}/new/.rss"
-            feed = feedparser.parse(rss_url)
-            for entry in feed.entries[:MAX_ITEMS_PER_SOURCE]:
-                items.append(
-                    to_item(
-                        source=source,
-                        title=getattr(entry, "title", ""),
-                        url=getattr(entry, "link", url),
-                        snippet=getattr(entry, "summary", ""),
-                        published=getattr(entry, "published", ""),
-                        item_type="reddit-rss",
-                    )
-                )
-            return items, "Reddit RSS fallback"
-        except Exception as exc_rss:
-            return [], f"Reddit 抓取失败：JSON={type(exc_json).__name__}; RSS={type(exc_rss).__name__}"
-
-
-def fetch_x(source: Dict[str, str]) -> Tuple[List[Dict[str, Any]], str]:
-    token = os.getenv("X_BEARER_TOKEN", "").strip()
-    if not token:
-        return [], "需要 X_BEARER_TOKEN；公开搜索页通常需要登录或会触发反爬"
-    if requests is None:
-        return [], "缺少 requests 依赖"
-
-    url = source.get("URL/入口", "")
-    parsed = urlparse(url)
-    query = (parse_qs(parsed.query).get("q") or ["VPN UK"])[0]
-    endpoint = "https://api.twitter.com/2/tweets/search/recent"
-    params = {
-        "query": query,
-        "max_results": min(max(MAX_ITEMS_PER_SOURCE, 10), 50),
-        "tweet.fields": "created_at,public_metrics,lang,author_id",
-    }
-    try:
-        resp = requests.get(
-            endpoint,
-            params=params,
-            headers={"Authorization": f"Bearer {token}", "User-Agent": DEFAULT_HEADERS["User-Agent"]},
-            timeout=REQUEST_TIMEOUT,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        items = []
-        for d in data.get("data", []):
-            tweet_id = d.get("id", "")
-            metrics = d.get("public_metrics", {}) or {}
-            items.append(
-                to_item(
-                    source=source,
-                    title=clean_text(d.get("text", ""), 140),
-                    url=f"https://x.com/i/web/status/{tweet_id}",
-                    snippet=d.get("text", ""),
-                    published=d.get("created_at", ""),
-                    item_type="x-api",
-                    metrics=metrics,
-                )
-            )
-        return items, "X API"
-    except Exception as exc:
-        return [], f"X API 抓取失败：{type(exc).__name__}"
-
-
-def fetch_youtube(source: Dict[str, str]) -> Tuple[List[Dict[str, Any]], str]:
-    api_key = os.getenv("YOUTUBE_API_KEY", "").strip()
-    url = source.get("URL/入口", "")
-    parsed = urlparse(url)
-    query = (parse_qs(parsed.query).get("search_query") or ["vpn uk"])[0]
-    if api_key and requests is not None:
-        try:
-            data = request_json(
-                "https://www.googleapis.com/youtube/v3/search",
-                params={
-                    "part": "snippet",
-                    "type": "video",
-                    "order": "relevance",
-                    "q": query,
-                    "regionCode": "GB",
-                    "maxResults": min(MAX_ITEMS_PER_SOURCE, 25),
-                    "key": api_key,
-                },
-            )
-            items = []
-            for row in data.get("items", []):
-                vid = (row.get("id") or {}).get("videoId", "")
-                sn = row.get("snippet", {})
-                items.append(
-                    to_item(
-                        source=source,
-                        title=sn.get("title", ""),
-                        url=f"https://www.youtube.com/watch?v={vid}" if vid else url,
-                        snippet=sn.get("description", ""),
-                        published=sn.get("publishedAt", ""),
-                        item_type="youtube-api",
-                        metrics={"channel": sn.get("channelTitle")},
-                    )
-                )
-            return items, "YouTube Data API"
-        except Exception as exc:
-            return [], f"YouTube API 抓取失败：{type(exc).__name__}"
-
-    # No-key fallback: parse search result HTML where possible.
-    try:
-        text, _ = request_text(url)
-        titles = []
-        # This regex is intentionally loose because YouTube HTML changes often.
-        for m in re.finditer(r'"title"\s*:\s*\{"runs"\s*:\s*\[\{"text"\s*:\s*"([^"]{8,160})"', text):
-            title = bytes(m.group(1), "utf-8").decode("unicode_escape", errors="ignore")
-            if "vpn" in title.lower() and title not in titles:
-                titles.append(clean_text(title, 180))
-            if len(titles) >= MAX_ITEMS_PER_SOURCE:
-                break
-        items = [to_item(source=source, title=t, url=url, snippet=f"YouTube search: {query}", item_type="youtube-search") for t in titles]
-        if items:
-            return items, "YouTube HTML fallback"
-        return [], "建议配置 YOUTUBE_API_KEY；网页搜索结果结构经常变化"
-    except Exception as exc:
-        return [], f"YouTube 抓取失败：{type(exc).__name__}"
-
-
-def fetch_app_store(source: Dict[str, str]) -> Tuple[List[Dict[str, Any]], str]:
-    try:
-        data = request_json(
-            "https://itunes.apple.com/search",
-            params={"term": "vpn", "country": "gb", "entity": "software", "limit": MAX_ITEMS_PER_SOURCE},
-        )
-        items = []
-        for app in data.get("results", []):
-            title = app.get("trackName", "")
-            snippet = "；".join(
-                clean_text(x, 160)
-                for x in [
-                    app.get("sellerName", ""),
-                    app.get("primaryGenreName", ""),
-                    app.get("averageUserRating", ""),
-                    app.get("userRatingCount", ""),
-                ]
-                if str(x)
-            )
-            items.append(
-                to_item(
-                    source=source,
-                    title=title,
-                    url=app.get("trackViewUrl", "https://apps.apple.com/gb/search?term=vpn"),
-                    snippet=snippet,
-                    item_type="app-store",
-                    metrics={
-                        "rating": app.get("averageUserRating"),
-                        "rating_count": app.get("userRatingCount"),
-                    },
-                )
-            )
-        return items, "Apple iTunes Search API"
-    except Exception as exc:
-        return [], f"App Store 抓取失败：{type(exc).__name__}"
-
-
-def fetch_google_play(source: Dict[str, str]) -> Tuple[List[Dict[str, Any]], str]:
-    try:
-        from google_play_scraper import search  # type: ignore
-
-        results = search("vpn", lang="en", country="gb", n_hits=MAX_ITEMS_PER_SOURCE)
-        items = []
-        for app in results:
-            app_id = app.get("appId", "")
-            items.append(
-                to_item(
-                    source=source,
-                    title=app.get("title", ""),
-                    url=f"https://play.google.com/store/apps/details?id={app_id}" if app_id else "https://play.google.com/store/search?q=vpn&c=apps",
-                    snippet=clean_text(app.get("summary", ""), 300),
-                    item_type="google-play",
-                    metrics={"score": app.get("score"), "installs": app.get("installs")},
-                )
-            )
-        return items, "google-play-scraper"
-    except Exception as exc:
-        return [], f"Google Play 需要 google-play-scraper 或手工/第三方 ASO 工具：{type(exc).__name__}"
-
-
-def fetch_google_serp(source: Dict[str, str]) -> Tuple[List[Dict[str, Any]], str]:
-    key = os.getenv("SERPAPI_KEY", "").strip()
-    if not key:
-        return [], "Google 搜索结果建议配置 SERPAPI_KEY；直接抓 Google 搜索结果不稳定"
-    url = source.get("URL/入口", "")
-    parsed = urlparse(url)
-    query = (parse_qs(parsed.query).get("q") or ["best vpn uk"])[0]
-    try:
-        data = request_json(
-            "https://serpapi.com/search.json",
-            params={"engine": "google", "q": query, "google_domain": "google.co.uk", "gl": "uk", "hl": "en", "api_key": key},
-        )
-        items = []
-        for row in data.get("organic_results", [])[:MAX_ITEMS_PER_SOURCE]:
-            items.append(
-                to_item(
-                    source=source,
-                    title=row.get("title", ""),
-                    url=row.get("link", url),
-                    snippet=row.get("snippet", ""),
-                    item_type="google-serp",
-                    metrics={"position": row.get("position")},
-                )
-            )
-        return items, "SerpApi Google UK"
-    except Exception as exc:
-        return [], f"SerpApi 抓取失败：{type(exc).__name__}"
-
-
-LINK_KEYWORDS = [
-    "vpn", "nord", "express", "proton", "surfshark", "windscribe", "mullvad",
-    "x-vpn", "privacy", "security", "streaming", "netflix", "iplayer", "uk",
-    "age", "online safety", "review", "best", "free", "deal", "discount",
-]
-
-
-def extract_article_links(base_url: str, soup: Any, limit: int = 8) -> List[Tuple[str, str]]:
-    links: List[Tuple[str, str]] = []
-    seen = set()
-    for a in soup.find_all("a"):
-        text = clean_text(a.get_text(" ", strip=True), 180)
-        href = a.get("href") or ""
-        if len(text) < 8 or not href:
-            continue
-        low = text.lower()
-        if not any(k in low for k in LINK_KEYWORDS):
-            continue
-        full = urljoin(base_url, href)
-        if full in seen:
-            continue
-        seen.add(full)
-        links.append((text, full))
-        if len(links) >= limit:
-            break
-    return links
-
-
-def fetch_generic_page(source: Dict[str, str]) -> Tuple[List[Dict[str, Any]], str]:
-    url = source.get("URL/入口", "")
-    if not is_http_url(url):
-        return [], "非公开 URL 或需要手工输入"
-    try:
-        text, content_type = request_text(url)
-        if BeautifulSoup is None:
-            title = clean_text(re.sub(r"<[^>]+>", " ", text), 160)
-            return [to_item(source=source, title=title or source.get("来源名称", ""), url=url, snippet="", item_type="web")], "web text"
-        soup = BeautifulSoup(text, "html.parser")
-        for tag in soup(["script", "style", "noscript", "svg"]):
-            tag.decompose()
-        title = ""
-        if soup.title and soup.title.string:
-            title = clean_text(soup.title.string, 220)
-        h1 = soup.find("h1")
-        if h1:
-            title = clean_text(h1.get_text(" ", strip=True), 220) or title
-        metas = []
-        for name in ["description", "og:description", "twitter:description"]:
-            meta = soup.find("meta", attrs={"name": name}) or soup.find("meta", attrs={"property": name})
-            if meta and meta.get("content"):
-                metas.append(clean_text(meta.get("content"), 300))
-        paragraphs = [clean_text(p.get_text(" ", strip=True), 300) for p in soup.find_all(["h2", "h3", "p"])[:40]]
-        body_text = " ".join([m for m in metas if m] + [p for p in paragraphs if p])
-        items = [to_item(source=source, title=title or source.get("来源名称", ""), url=url, snippet=body_text, item_type="web-page")]
-        for link_text, link_url in extract_article_links(url, soup, limit=6):
-            items.append(to_item(source=source, title=link_text, url=link_url, snippet=f"页面内相关链接：{title}", item_type="web-link"))
-        return items[:MAX_ITEMS_PER_SOURCE], f"web page ({content_type})"
-    except Exception as exc:
-        return [], f"网页抓取失败：{type(exc).__name__}"
-
-
-def fetch_source(source: Dict[str, str]) -> Tuple[List[Dict[str, Any]], FetchResult]:
-    start = time.time()
-    platform = source.get("平台", "")
-    category = source.get("来源类别", "")
-    name = source.get("来源名称", "")
-    url = source.get("URL/入口", "")
-    items: List[Dict[str, Any]] = []
-    note = ""
-    status = "fetched"
-
-    try:
-        low_platform = platform.lower()
-        low_category = category.lower()
-        low_url = url.lower()
-
-        if not is_http_url(url):
-            status = "limited"
-            note = "非公开链接、Discord、应用商店手工入口或需补充邀请/API"
-        elif "twitter" in low_platform or "x.com" in low_url:
-            items, note = fetch_x(source)
-            status = "fetched" if items else "limited"
-        elif "reddit" in low_platform or "reddit.com" in low_url:
-            items, note = fetch_reddit(source)
-            status = "fetched" if items else "failed"
-        elif "youtube" in low_platform or "youtube.com" in low_url:
-            items, note = fetch_youtube(source)
-            status = "fetched" if items else "limited"
-        elif "tiktok" in low_platform or "tiktok.com" in low_url:
-            # TikTok public search is often protected; try generic once and mark partial.
-            items, note = fetch_generic_page(source)
-            status = "partial" if items else "limited"
-        elif "google search" in name.lower() or "google.co" in low_url:
-            items, note = fetch_google_serp(source)
-            status = "fetched" if items else "limited"
-        elif "app store" in platform.lower() or "apple app store" in name.lower():
-            items, note = fetch_app_store(source)
-            status = "fetched" if items else "failed"
-        elif "google play" in platform.lower() or "google play" in name.lower():
-            items, note = fetch_google_play(source)
-            status = "fetched" if items else "limited"
-        else:
-            items, note = fetch_generic_page(source)
-            status = "fetched" if items else "failed"
-    except Exception as exc:  # keep the whole run alive
-        status = "failed"
-        note = f"抓取异常：{type(exc).__name__}: {exc}"
-
-    elapsed_ms = int((time.time() - start) * 1000)
-    return items, FetchResult(
-        source_name=name,
-        platform=platform,
-        url=url,
-        status=status,
-        item_count=len(items),
-        note=note,
-        elapsed_ms=elapsed_ms,
+def include_source(row: Dict[str, str]) -> bool:
+    layer = row.get("日报层级", "")
+    freq = row.get("追踪频率", "")
+    candidate = row.get("是否候选", "")
+    sustainable = row.get("是否可持续追踪", "")
+    pri = source_priority(row)
+    return (
+        "核心" in layer
+        or "周更" in layer
+        or "每日" in freq
+        or "每周" in freq
+        or sustainable == "是"
+        or candidate == "是"
+        or pri >= 5
     )
 
 
-THEMES: Dict[str, Dict[str, Any]] = {
-    "policy": {
-        "name": "政策 / 年龄验证 / VPN 合法性",
-        "keywords": [
-            "online safety", "ofcom", "ico", "age assurance", "age verification", "under 16",
-            "children", "child safety", "regulation", "law", "government", "bill", "act",
-            "vpn ban", "verify age", "legal", "compliance", "uk government", "政策", "年龄验证", "合规"
-        ],
-        "title": "政策与年龄验证议题继续升温，VPN 绕过和合规表述需要重点监控",
-        "audience": "家长、学生、英国本地用户、隐私关注用户、媒体读者",
-        "action": "准备“合规、安全、隐私不冲突”的内容话术；避免鼓励规避监管，聚焦隐私保护、公共 Wi‑Fi 安全和家长教育。",
-        "tags": ["政策", "UK", "年龄验证", "合规"],
-        "owner": "政策监控 + 内容",
-        "impact": 94,
-        "industry": 95,
-        "growth": 88,
-    },
-    "streaming": {
-        "name": "流媒体可用性 / 平台检测 / IP 信誉",
-        "keywords": [
-            "netflix", "prime video", "amazon prime", "bbc iplayer", "iplayer", "disney", "hulu",
-            "streaming", "unblock", "geo", "region", "detected", "blocked", "proxy", "ip reputation",
-            "captcha", "residential ip", "youtube premium", "流媒体", "解锁", "地区", "被识别"
-        ],
-        "title": "流媒体、地区切换和 IP 被识别仍是最靠近转化的高频痛点",
-        "audience": "流媒体用户、旅行用户、价格敏感用户、游戏/娱乐用户",
-        "action": "建立 UK/US 流媒体可用性监控；内容页突出“可用节点推荐、自动切换、失败排查、IP 信誉”。",
-        "tags": ["Streaming", "IP reputation", "Netflix", "BBC iPlayer"],
-        "owner": "产品 + 运营",
-        "impact": 91,
-        "industry": 90,
-        "growth": 96,
-    },
-    "competitor": {
-        "name": "竞品口碑 / 续费 / 取消 / 客服",
-        "keywords": [
-            "nordvpn", "nord vpn", "expressvpn", "express vpn", "protonvpn", "proton vpn",
-            "windscribe", "mullvad", "surfshark", "pia", "private internet access",
-            "x-vpn", "xvpn", "refund", "renewal", "subscription", "cancel", "support",
-            "客服", "续费", "退款", "取消", "竞品"
-        ],
-        "title": "竞品用户抱怨集中在续费透明、取消路径、客服响应和节点稳定",
-        "audience": "竞品存量用户、价格敏感用户、购买前搜索用户",
-        "action": "用“透明价格、到期提醒、易取消、故障排查响应快”做竞品转化页和社区回复脚本。",
-        "tags": ["竞品", "Churn", "Renewal", "Support"],
-        "owner": "增长 + 客服 + 支付",
-        "impact": 88,
-        "industry": 90,
-        "growth": 93,
-    },
-    "uk_nodes": {
-        "name": "英国节点 / 城市节点 / CAPTCHA",
-        "keywords": [
-            "uk server", "uk servers", "london", "manchester", "united kingdom", "british",
-            "gb", "great britain", "captcha", "ip blocked", "server down", "slow server",
-            "英国节点", "伦敦", "曼彻斯特"
-        ],
-        "title": "英国城市级节点、CAPTCHA 和网站兼容性是 UK 市场的底层体验指标",
-        "audience": "英国本地用户、留学生、旅行用户、远程办公用户",
-        "action": "建立 London/Manchester 等城市节点健康度看板，监控 CAPTCHA、银行/地图/流媒体兼容和速度。",
-        "tags": ["UK servers", "CAPTCHA", "London", "Manchester"],
-        "owner": "网络 + 增长",
-        "impact": 87,
-        "industry": 89,
-        "growth": 91,
-    },
-    "price_free": {
-        "name": "免费版 / 价格敏感 / Deal",
-        "keywords": [
-            "free vpn", "free", "deal", "discount", "coupon", "cheap", "pricing", "price",
-            "student", "family plan", "trial", "money back", "refund", "免费", "价格", "优惠", "学生价"
-        ],
-        "title": "免费额度、学生价、家庭套餐和退款承诺仍是增长入口",
-        "audience": "学生、轻度用户、价格敏感用户、免费 VPN 搜索用户",
-        "action": "测试“免费额度 → UK/流媒体试用 → 限时付费”的路径，并突出无套路取消和价格透明。",
-        "tags": ["Free VPN", "Deals", "学生", "价格敏感"],
-        "owner": "增长 + 支付",
-        "impact": 82,
-        "industry": 79,
-        "growth": 95,
-    },
-    "public_wifi": {
-        "name": "公共 Wi‑Fi / 校园 / 移动网络",
-        "keywords": [
-            "public wifi", "wi-fi", "wifi", "airport", "hotel", "school", "university",
-            "eduroam", "campus", "5g", "mobile", "bank", "maps", "公共", "机场", "酒店", "校园", "留学"
-        ],
-        "title": "公共 Wi‑Fi、校园网、5G 和旅行场景需要更少打扰的自动化体验",
-        "audience": "学生、旅行/出差用户、远程办公、移动端用户",
-        "action": "产品和内容围绕“自动连接、分应用/分流、低电量、兼容银行/地图/音乐 App”打包。",
-        "tags": ["Public Wi‑Fi", "Student", "Mobile", "Travel"],
-        "owner": "内容 + 产品",
-        "impact": 83,
-        "industry": 82,
-        "growth": 87,
-    },
-    "privacy_trust": {
-        "name": "隐私信任 / 审计 / 泄漏风险",
-        "keywords": [
-            "no logs", "no-log", "audit", "privacy policy", "webrtc", "dns leak", "leak",
-            "wireguard", "open source", "closed source", "transparency", "jurisdiction",
-            "tracking", "logs", "隐私", "审计", "泄漏", "日志"
-        ],
-        "title": "隐私信任、审计、WebRTC/DNS 泄漏和透明报告继续影响购买前判断",
-        "audience": "隐私安全用户、技术用户、媒体评测读者",
-        "action": "准备审计/透明报告/协议说明/WebRTC 修复证据包，让外部评测和购买前页面有可引用材料。",
-        "tags": ["Privacy", "Audit", "WebRTC", "No logs"],
-        "owner": "品牌 + 法务 + 安全",
-        "impact": 86,
-        "industry": 88,
-        "growth": 84,
-    },
-    "gaming": {
-        "name": "游戏 / Ping / Discord / 路由",
-        "keywords": [
-            "gaming", "game", "ping", "latency", "discord", "fortnite", "valorant", "steam",
-            "packet loss", "routing", "游戏", "延迟", "掉线"
-        ],
-        "title": "游戏 Ping、Discord 和路由稳定性是低频但高情绪强度需求",
-        "audience": "游戏玩家、宿舍/校园网络用户、Discord 社群",
-        "action": "用真实节点延迟、游戏分流、Discord 语音稳定性做小规模 KOC 测试和案例页。",
-        "tags": ["Gaming", "Ping", "Discord", "Routing"],
-        "owner": "用户研究 + KOC",
-        "impact": 73,
-        "industry": 72,
-        "growth": 78,
-    },
-    "censorship": {
-        "name": "审查地区 / 协议 / 可用性测试",
-        "keywords": [
-            "china", "gfw", "iran", "russia", "dpi", "obfuscation", "shadowsocks", "vless",
-            "reality", "trojan", "blocked country", "censorship", "审查", "中国", "伊朗", "俄罗斯", "协议"
-        ],
-        "title": "审查地区用户更关注协议、可用性反馈和真实测试状态",
-        "audience": "高技术用户、审查地区用户、可用性测试用户",
-        "action": "避免高风险承诺，改做透明可用性状态和授权测试用户反馈池。",
-        "tags": ["Censorship", "Protocol", "Testing", "KOC"],
-        "owner": "用户研究 + 网络",
-        "impact": 76,
-        "industry": 83,
-        "growth": 80,
-    },
-    "content_affiliate": {
-        "name": "媒体榜单 / KOC / Affiliate 内容",
-        "keywords": [
-            "best vpn", "review", "comparison", "top vpn", "affiliate", "youtube", "tiktok",
-            "ranking", "guide", "how to", "评测", "榜单", "推荐"
-        ],
-        "title": "媒体榜单和 KOC 内容仍在重塑购买前认知，适合做场景化反向选题",
-        "audience": "购买前搜索用户、YouTube/TikTok 受众、联盟评测读者",
-        "action": "拆解榜单维度，制作“按场景选 VPN”：UK 节点、隐私、流媒体、价格、学生、游戏。",
-        "tags": ["SEO", "Affiliate", "KOC", "Review"],
-        "owner": "内容 + KOC",
-        "impact": 80,
-        "industry": 86,
-        "growth": 89,
-    },
-}
+def domain_of(url: str) -> str:
+    parsed = urlparse(clean_text(url if url.startswith("http") else "https://" + url))
+    host = (parsed.netloc or "").lower().split("@")[(-1)].split(":")[0]
+    if host.startswith("www."):
+        host = host[4:]
+    return host
 
 
-def classify_item(item: Dict[str, Any]) -> List[Tuple[str, int, List[str]]]:
-    text = " ".join(
-        [
-            item.get("title", ""),
-            item.get("snippet", ""),
-            item.get("source", ""),
-            item.get("source_note", ""),
-            item.get("key_info", ""),
-            item.get("target_user", ""),
-        ]
-    ).lower()
-    results: List[Tuple[str, int, List[str]]] = []
-    for theme_id, rule in THEMES.items():
-        hits: List[str] = []
-        for kw in rule["keywords"]:
-            if kw.lower() in text:
-                hits.append(kw)
-        if hits:
-            score = len(set(hits)) * 10 + min(item.get("source_priority", 1), 10) * 3
-            if item.get("tier") == "核心日报源":
-                score += 12
-            if item.get("type", "").startswith("reddit"):
-                score += 7
-            if item.get("type", "") in {"app-store", "google-play", "youtube-api", "google-serp"}:
-                score += 5
-            results.append((theme_id, score, hits[:8]))
-    return sorted(results, key=lambda x: x[1], reverse=True)
+def domain_matches(domain: str, candidates: Iterable[str]) -> bool:
+    return any(domain == c or domain.endswith("." + c) for c in candidates)
 
 
-def score_and_bucket_items(items: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-    buckets: Dict[str, List[Dict[str, Any]]] = {k: [] for k in THEMES}
-    for item in items:
-        classifications = classify_item(item)
-        item["themes"] = [{"id": tid, "score": score, "hits": hits} for tid, score, hits in classifications[:3]]
-        for tid, score, hits in classifications[:3]:
-            enriched = dict(item)
-            enriched["theme_score"] = score
-            enriched["theme_hits"] = hits
-            buckets[tid].append(enriched)
-    for tid in buckets:
-        buckets[tid].sort(key=lambda x: (x.get("theme_score", 0), x.get("source_priority", 0)), reverse=True)
-    return buckets
+def is_competitor_official_social(row: Dict[str, str], domain: str, text: str) -> bool:
+    if not domain_matches(domain, SOCIAL_DOMAINS):
+        return False
+    if "搜索" in row.get("来源名称", "") or "search" in row.get("URL/入口", "").lower():
+        return False
+    return any(b in text for b in COMPETITOR_BRANDS) or "官方" in text or "official" in text
 
 
-def compact_title_list(items: List[Dict[str, Any]], n: int = 3) -> str:
-    parts = []
-    for item in items[:n]:
-        src = item.get("source") or item.get("platform")
-        title = clean_text(item.get("title", ""), 80)
-        if title:
-            parts.append(f"{src}《{title}》")
-    return "；".join(parts)
+def source_taxonomy(row: Dict[str, str]) -> str:
+    # Source-type rules first. New v3 labels are preferred over legacy columns.
+    explicit = normalize_category(row.get("新版分类") or row.get("面板类别") or row.get("面板分类") or row.get("情报大类"))
+    url = clean_text(row.get("URL/入口"))
+    domain = domain_of(url) if url.startswith("http") else ""
+    text = " ".join([
+        row.get("来源类别", ""), row.get("平台", ""), row.get("来源名称", ""),
+        row.get("备注", ""), row.get("URL/入口", ""), row.get("采集策略", ""), row.get("子分类", ""), explicit,
+    ]).lower()
+    if "reddit" in domain or "reddit" in text:
+        return "reddit讨论"
+    if domain and domain_matches(domain, GOVERNMENT_DOMAINS):
+        return "政策风险"
+    if any(k in text for k in ["government", "regulator", "gov.uk", "ofcom", "ico", "监管机构", "政府"]):
+        return "政策风险"
+    if is_competitor_official_social(row, domain, text):
+        return "社交媒体"
+    # Official-domain forums, community boards and user reviews are not official competitor announcements.
+    if any(k in text for k in ["forum", "forums", "community", "社区", "论坛", "review", "reviews", "trustpilot"]):
+        return "第三方网站"
+    official_page_hint = any(k in text for k in [
+        "官方博客", "官方新闻", "官方公告", "official blog", "official news", "official announcements",
+        "press room", "press area", "newsroom", "status", "changelog", "release notes", "privacy hub",
+    ])
+    if explicit == "竞品动态" and domain and domain_matches(domain, COMPETITOR_DOMAINS):
+        return "竞品动态"
+    if domain and domain_matches(domain, COMPETITOR_DOMAINS) and official_page_hint:
+        return "竞品动态"
+    if official_page_hint:
+        return "竞品动态"
+    # Explicit labels are honored after hard source-type checks; stale 政策风险 labels are not honored for non-government pages.
+    if explicit and explicit != "政策风险":
+        return explicit
+    return "第三方网站"
 
 
-def make_fallback_dashboard(
-    items: List[Dict[str, Any]],
-    sources: List[Dict[str, str]],
-    fetch_results: List[FetchResult],
-    previous: Dict[str, Any],
-    generated_at: dt.datetime,
-    seed: Dict[str, Any],
-) -> Dict[str, Any]:
-    buckets = score_and_bucket_items(items)
-    findings: List[Dict[str, Any]] = []
-    signals: List[Dict[str, Any]] = []
+def guess_category_from_item(item: Dict[str, Any], source_row: Dict[str, str]) -> str:
+    cat = source_taxonomy(source_row)
+    if cat in TAXONOMY_ORDER:
+        return cat
+    return "第三方网站"
 
-    prev_signal_map = {s.get("name"): s for s in previous.get("signals", []) if isinstance(s, dict)}
-    for theme_id, bucket in buckets.items():
-        if not bucket:
+
+def match_rule(text: str, rules: List[Tuple[str, List[str]]], default: str) -> Tuple[str, List[str]]:
+    lowered = text.lower()
+    best_name = default
+    best_hits: List[str] = []
+    for name, keywords in rules:
+        hits = [kw for kw in keywords if kw.lower() in lowered]
+        if len(hits) > len(best_hits):
+            best_name = name
+            best_hits = hits[:8]
+    return best_name, best_hits
+
+
+def classify_issue(text: str) -> Tuple[str, List[str]]:
+    return match_rule(text, ISSUE_RULES, "综合观察")
+
+
+def infer_subcategory(category: str, text: str) -> Tuple[str, List[str]]:
+    defaults = {
+        "竞品动态": "官网综合动态",
+        "社交媒体": "官方社媒综合",
+        "reddit讨论": "用户综合讨论",
+        "政策风险": "政策综合风险",
+        "第三方网站": "第三方综合观察",
+    }
+    return match_rule(text, SUBCATEGORY_RULES.get(category, []), defaults.get(category, "综合观察"))
+
+
+def priority_label(score: float) -> str:
+    for threshold, label in PRIORITY_LABELS:
+        if score >= threshold:
+            return label
+    return "P3"
+
+
+def with_limit(url: str, limit: int = MAX_ITEMS_PER_SOURCE) -> str:
+    parsed = urlparse(url)
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query.setdefault("limit", str(limit))
+    return urlunparse(parsed._replace(query=urlencode(query)))
+
+
+def fetch_url(url: str, *, accept_json: bool = False, reddit: bool = False, bearer: Optional[str] = None) -> requests.Response:
+    headers: Dict[str, str] = {}
+    if accept_json:
+        headers["Accept"] = "application/json,text/plain,*/*"
+    if reddit:
+        headers["User-Agent"] = REDDIT_USER_AGENT
+    if bearer:
+        headers["Authorization"] = f"Bearer {bearer}"
+        headers["User-Agent"] = REDDIT_USER_AGENT
+    resp = SESSION.get(url, timeout=HTTP_TIMEOUT, headers=headers, allow_redirects=True)
+    resp.raise_for_status()
+    return resp
+
+
+def parse_datetime(value: Any, now: Optional[dt.datetime] = None) -> Optional[dt.datetime]:
+    text = clean_text(value)
+    if not text:
+        return None
+    now = now or now_sg()
+    lowered = text.lower()
+    rel = re.search(r"(\d+)\s*(minute|minutes|min|hour|hours|day|days|week|weeks|month|months|year|years)\s+ago", lowered)
+    if rel:
+        n = int(rel.group(1))
+        unit = rel.group(2)
+        if unit.startswith("min"):
+            return now - dt.timedelta(minutes=n)
+        if unit.startswith("hour"):
+            return now - dt.timedelta(hours=n)
+        if unit.startswith("day"):
+            return now - dt.timedelta(days=n)
+        if unit.startswith("week"):
+            return now - dt.timedelta(days=7 * n)
+        if unit.startswith("month"):
+            return now - dt.timedelta(days=30 * n)
+        if unit.startswith("year"):
+            return now - dt.timedelta(days=365 * n)
+    if lowered in {"today", "今天"}:
+        return now
+    if lowered in {"yesterday", "昨天"}:
+        return now - dt.timedelta(days=1)
+    if re.fullmatch(r"\d{9,11}(\.\d+)?", text):
+        try:
+            return dt.datetime.fromtimestamp(float(text), tz=dt.timezone.utc)
+        except Exception:
+            pass
+    try:
+        parsed = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.timezone.utc)
+    except Exception:
+        pass
+    try:
+        parsed = email.utils.parsedate_to_datetime(text)
+        if parsed:
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.timezone.utc)
+    except Exception:
+        pass
+    if date_parser is not None:
+        try:
+            parsed = date_parser.parse(text, fuzzy=True)
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.timezone.utc)
+        except Exception:
+            return None
+    return None
+
+
+MONTHS = "Jan|January|Feb|February|Mar|March|Apr|April|May|Jun|June|Jul|July|Aug|August|Sep|Sept|September|Oct|October|Nov|November|Dec|December"
+DATE_PATTERNS = [
+    rf"\b(?:{MONTHS})\s+\d{{1,2}},\s*20\d{{2}}\b",
+    rf"\b\d{{1,2}}\s+(?:{MONTHS})\s+20\d{{2}}\b",
+    r"\b20\d{2}[-/]\d{1,2}[-/]\d{1,2}\b",
+    r"\b\d{1,2}[-/]\d{1,2}[-/]20\d{2}\b",
+]
+
+
+def extract_date_from_text(text: str, now: Optional[dt.datetime] = None) -> Optional[dt.datetime]:
+    text = clean_text(text)
+    if not text:
+        return None
+    for pat in DATE_PATTERNS:
+        m = re.search(pat, text, flags=re.I)
+        if m:
+            parsed = parse_datetime(m.group(0), now)
+            if parsed:
+                return parsed
+    rel = re.search(r"\b\d+\s*(?:minute|minutes|min|hour|hours|day|days|week|weeks|month|months|year|years)\s+ago\b", text, flags=re.I)
+    if rel:
+        return parse_datetime(rel.group(0), now)
+    return None
+
+
+def to_sg(dt_value: dt.datetime) -> dt.datetime:
+    tz = ZoneInfo("Asia/Singapore") if ZoneInfo else dt.timezone(dt.timedelta(hours=8))
+    if dt_value.tzinfo is None:
+        dt_value = dt_value.replace(tzinfo=dt.timezone.utc)
+    return dt_value.astimezone(tz)
+
+
+def to_iso(dt_value: Optional[dt.datetime]) -> str:
+    if not dt_value:
+        return ""
+    return to_sg(dt_value).isoformat()
+
+
+def extract_page_date(soup: BeautifulSoup, now: Optional[dt.datetime] = None) -> Optional[dt.datetime]:
+    selectors = [
+        ("meta", {"property": "article:published_time"}),
+        ("meta", {"property": "article:modified_time"}),
+        ("meta", {"property": "og:updated_time"}),
+        ("meta", {"name": "date"}),
+        ("meta", {"name": "pubdate"}),
+        ("meta", {"name": "publishdate"}),
+        ("meta", {"name": "timestamp"}),
+        ("meta", {"name": "DC.date"}),
+        ("meta", {"itemprop": "datePublished"}),
+        ("meta", {"itemprop": "dateModified"}),
+    ]
+    for name, attrs in selectors:
+        tag = soup.find(name, attrs=attrs)
+        if tag:
+            val = clean_text(tag.get("content") or tag.get("datetime") or tag.get_text(" "))
+            parsed = parse_datetime(val, now)
+            if parsed:
+                return parsed
+    for script in soup.find_all("script", attrs={"type": "application/ld+json"})[:10]:
+        try:
+            payload = json.loads(script.string or script.get_text(" ") or "")
+        except Exception:
             continue
-        rule = THEMES[theme_id]
-        volume_score = min(len(bucket) * 7, 30)
-        top_score = min(bucket[0].get("theme_score", 0), 60)
-        heat = int(min(99, max(55, (rule["impact"] * 0.35 + rule["industry"] * 0.25 + rule["growth"] * 0.25 + volume_score * 0.5 + top_score * 0.25))))
-        confidence = int(min(95, 55 + min(len(bucket), 8) * 4 + min(len({x.get("source") for x in bucket}), 6) * 3))
-        priority = "P0" if heat >= 88 else ("P1" if heat >= 76 else "P2")
-        evidence = (
-            f"今日抓取到 {len(bucket)} 条相关信号，主要来自 "
-            f"{', '.join(sorted({x.get('source') for x in bucket[:8] if x.get('source')}))}。"
-            f"代表内容：{compact_title_list(bucket, 3)}。"
-        )
-        top = bucket[0]
-        finding = {
-            "priority": priority,
-            "theme": rule["name"],
-            "title": rule["title"],
-            "source": top.get("source", ""),
-            "url": top.get("url", ""),
-            "evidence": clean_text(evidence, 460),
-            "audience": rule["audience"],
-            "impact": int(min(99, rule["impact"] + min(len(bucket), 5))),
-            "industry": int(min(99, rule["industry"] + min(len({x.get('source') for x in bucket}), 4))),
-            "growth": int(min(99, rule["growth"] + (3 if priority == "P0" else 0))),
-            "action": rule["action"],
-            "tags": rule["tags"],
-            "supporting_items": [
-                {
-                    "title": x.get("title"),
-                    "url": x.get("url"),
-                    "source": x.get("source"),
-                    "snippet": clean_text(x.get("snippet", ""), 220),
-                    "score": x.get("theme_score"),
-                    "hits": x.get("theme_hits", []),
-                }
-                for x in bucket[:6]
-            ],
-        }
-        findings.append(finding)
+        stack = payload if isinstance(payload, list) else [payload]
+        while stack:
+            obj = stack.pop(0)
+            if isinstance(obj, list):
+                stack.extend(obj)
+            elif isinstance(obj, dict):
+                for key in ["datePublished", "dateModified", "uploadDate", "publishedAt"]:
+                    parsed = parse_datetime(obj.get(key), now)
+                    if parsed:
+                        return parsed
+                for val in obj.values():
+                    if isinstance(val, (dict, list)):
+                        stack.append(val)
+    time_tag = soup.find("time")
+    if time_tag:
+        parsed = parse_datetime(time_tag.get("datetime") or time_tag.get("title") or time_tag.get_text(" "), now)
+        if parsed:
+            return parsed
+    body_text = clean_text(soup.get_text(" "))[:5000]
+    return extract_date_from_text(body_text, now)
 
-        old_heat = (prev_signal_map.get(rule["name"]) or {}).get("heat")
-        delta = heat - old_heat if isinstance(old_heat, int) else None
-        if delta is None:
-            direction = "新信号"
-        elif delta >= 5:
-            direction = f"上升 +{delta}"
-        elif delta <= -5:
-            direction = f"下降 {delta}"
-        else:
-            direction = "稳定"
-        signals.append(
+
+def extract_item_date(container: Any, page_date: Optional[dt.datetime], now: Optional[dt.datetime] = None) -> Optional[dt.datetime]:
+    if container:
+        time_tag = container.find("time") if hasattr(container, "find") else None
+        if time_tag:
+            parsed = parse_datetime(time_tag.get("datetime") or time_tag.get("title") or time_tag.get_text(" "), now)
+            if parsed:
+                return parsed
+        for attr in ["datetime", "data-date", "data-time", "data-published", "title"]:
+            if hasattr(container, "get"):
+                parsed = parse_datetime(container.get(attr), now)
+                if parsed:
+                    return parsed
+        if hasattr(container, "get_text"):
+            parsed = extract_date_from_text(container.get_text(" ")[:900], now)
+            if parsed:
+                return parsed
+    return page_date
+
+
+def format_date(value: Any) -> str:
+    parsed = parse_datetime(value)
+    if not parsed:
+        return "未确认"
+    return to_sg(parsed).strftime("%Y-%m-%d %H:%M SGT")
+
+
+def item_age_days(item: Dict[str, Any], now: Optional[dt.datetime] = None) -> Optional[float]:
+    now = now or now_sg()
+    parsed = parse_datetime(item.get("published_at"), now)
+    if not parsed:
+        return None
+    delta = now - to_sg(parsed)
+    return max(0.0, delta.total_seconds() / 86400)
+
+
+def age_label(age_days: Optional[float]) -> str:
+    if age_days is None:
+        return "无法确认"
+    hours = age_days * 24
+    if hours < 1:
+        return "1小时内"
+    if hours < 24:
+        return f"{int(hours)}小时前"
+    if hours < 2 * 24:
+        return "1天前"
+    return f"{int(age_days)}天前"
+
+
+def freshness_window(category: str) -> float:
+    return float(FRESHNESS_DAYS.get(category, env_int("FRESHNESS_WINDOW_DAYS", 7)))
+
+
+def freshness_window_hours(category: str) -> int:
+    return int(round(freshness_window(category) * 24))
+
+
+def freshness_window_label(category: str) -> str:
+    days = freshness_window(category)
+    if days < 1:
+        return f"{int(round(days * 24))}小时"
+    if abs(days - int(days)) < 0.001:
+        return f"{int(days)}天"
+    return f"{days:.1f}天"
+
+
+def freshness_window_label(category: str) -> str:
+    return f"{freshness_window_hours(category)}小时"
+
+
+def is_current_item(item: Dict[str, Any], now: Optional[dt.datetime] = None) -> Tuple[bool, str]:
+    now = now or now_sg()
+    category = item.get("intelligence_category") or "第三方网站"
+    max_days = freshness_window(category)
+    max_hours = freshness_window_hours(category)
+    age = item_age_days(item, now)
+    if age is None:
+        if UNKNOWN_DATE_POLICY == "include":
+            return True, "未确认发布时间；已按 UNKNOWN_DATE_POLICY=include 纳入"
+        return False, "无法确认发布时间，已从主面板隐藏"
+    if age <= max_days:
+        return True, f"{age_label(age)}，在 {max_hours} 小时时效窗口内"
+    return False, f"{age_label(age)}，超过 {max_hours} 小时时效窗口"
+
+
+def reddit_listing_parts(url: str) -> Dict[str, str]:
+    parsed = urlparse(url)
+    path = parsed.path or "/"
+    query = parsed.query
+    path = re.sub(r"/+$", "", path)
+    if re.match(r"^/r/[^/]+$", path, flags=re.I):
+        path = path + "/new"
+    if not path.startswith("/r/"):
+        return {}
+    if path.endswith(".json"):
+        path = path[:-5]
+    if path.endswith(".rss"):
+        path = path[:-4]
+    return {"path": path, "query": query}
+
+
+def reddit_candidate_urls(url: str) -> Dict[str, List[str]]:
+    parts = reddit_listing_parts(url)
+    if not parts:
+        return {"oauth": [], "json": [], "rss": [], "old_html": []}
+    path = parts["path"]
+    query = parts["query"]
+    json_url = urlunparse(("https", "www.reddit.com", path + ".json", "", query, ""))
+    rss_url = urlunparse(("https", "www.reddit.com", path + ".rss", "", query, ""))
+    old_url = urlunparse(("https", "old.reddit.com", path + "/", "", query, ""))
+    oauth_url = urlunparse(("https", "oauth.reddit.com", path, "", query, ""))
+    alt_rss = []
+    m = re.match(r"^/r/([^/]+)", path, flags=re.I)
+    if m:
+        alt_rss.append(f"https://www.reddit.com/r/{m.group(1)}/.rss?limit={MAX_ITEMS_PER_SOURCE}")
+    return {
+        "oauth": [with_limit(oauth_url)],
+        "json": [with_limit(json_url)],
+        "rss": [with_limit(rss_url)] + alt_rss,
+        "old_html": [with_limit(old_url)],
+    }
+
+
+def get_reddit_token() -> Optional[str]:
+    global _REDDIT_TOKEN, _REDDIT_TOKEN_EXPIRES
+    if _REDDIT_TOKEN and time.time() < _REDDIT_TOKEN_EXPIRES - 60:
+        return _REDDIT_TOKEN
+    client_id = os.getenv("REDDIT_CLIENT_ID", "").strip()
+    client_secret = os.getenv("REDDIT_CLIENT_SECRET", "").strip()
+    if not client_id or not client_secret:
+        return None
+    auth = requests.auth.HTTPBasicAuth(client_id, client_secret)
+    headers = {"User-Agent": REDDIT_USER_AGENT}
+    data = {"grant_type": "client_credentials"}
+    resp = SESSION.post("https://www.reddit.com/api/v1/access_token", auth=auth, data=data, headers=headers, timeout=HTTP_TIMEOUT)
+    resp.raise_for_status()
+    payload = resp.json()
+    _REDDIT_TOKEN = payload.get("access_token")
+    _REDDIT_TOKEN_EXPIRES = time.time() + int(payload.get("expires_in", 3600))
+    return _REDDIT_TOKEN
+
+
+def parse_reddit_json(data: Any, row: Dict[str, str], fallback_url: str) -> List[Dict[str, Any]]:
+    children: List[Dict[str, Any]] = []
+    if isinstance(data, dict):
+        children = data.get("data", {}).get("children", []) or []
+    elif isinstance(data, list) and data:
+        children = data[0].get("data", {}).get("children", []) or []
+    items: List[Dict[str, Any]] = []
+    for child in children[:MAX_ITEMS_PER_SOURCE]:
+        d = child.get("data", {}) if isinstance(child, dict) else {}
+        title = clean_text(d.get("title"))
+        if not title:
+            continue
+        permalink = d.get("permalink") or ""
+        item_url = "https://www.reddit.com" + permalink if permalink.startswith("/") else clean_text(d.get("url") or fallback_url)
+        created = d.get("created_utc")
+        created_iso = to_iso(parse_datetime(str(created))) if created else ""
+        items.append(
             {
-                "name": rule["name"],
-                "heat": heat,
-                "confidence": confidence,
-                "direction": direction,
-                "owner": rule["owner"],
-                "item_count": len(bucket),
+                "title": title,
+                "snippet": clean_text(d.get("selftext") or d.get("link_flair_text") or "")[:520],
+                "url": item_url,
+                "published_at": created_iso,
+                "source_name": row.get("来源名称", "Reddit"),
+                "platform": "Reddit",
+                "source_category": row.get("来源类别", "社区"),
+                "raw_score": int(d.get("score") or 0),
+                "comments": int(d.get("num_comments") or 0),
+                "fetch_method": "reddit_json_or_oauth",
             }
         )
+    return items
 
-    findings.sort(key=lambda f: ({"P0": 3, "P1": 2, "P2": 1}.get(f["priority"], 0), f["impact"] + f["growth"] + f["industry"]), reverse=True)
-    findings = findings[:10]
-    signals.sort(key=lambda s: s["heat"], reverse=True)
-    signals = signals[:10]
 
-    actions = []
-    seen_action = set()
-    for f in findings[:8]:
-        tid = None
-        for k, r in THEMES.items():
-            if r["name"] == f["theme"]:
-                tid = k
-                break
-        rule = THEMES.get(tid or "", {})
-        lane = (rule.get("owner") or "运营").split("+")[0].strip()
-        task = f["action"]
-        if task in seen_action:
+def parse_reddit_rss(text: str, row: Dict[str, str], feed_url: str) -> List[Dict[str, Any]]:
+    soup = BeautifulSoup(text, "xml")
+    entries = soup.find_all("entry") or soup.find_all("item")
+    items: List[Dict[str, Any]] = []
+    for entry in entries[:MAX_ITEMS_PER_SOURCE]:
+        title = clean_text(entry.find_text("title"))
+        if not title:
             continue
-        seen_action.add(task)
-        actions.append({"lane": lane, "task": task, "why": f"来自今日 {f['theme']} 信号", "priority": f["priority"]})
-
-    if not findings and seed.get("findings"):
-        findings = seed.get("findings", [])
-        signals = seed.get("signals", [])
-        actions = seed.get("actions", [])
-        for f in findings:
-            f.setdefault("evidence", "")
-        seed_note = {
-            "source": "自动抓取",
-            "status": "回退",
-            "note": "本次没有抓到足够公开信号，页面沿用种子日报结构；请检查网络、API Key 或来源配置。",
-        }
-    else:
-        seed_note = None
-
-    fetched = [r for r in fetch_results if r.status == "fetched"]
-    partial = [r for r in fetch_results if r.status == "partial"]
-    failed = [r for r in fetch_results if r.status == "failed"]
-    limited = [r for r in fetch_results if r.status == "limited"]
-    skipped = [r for r in fetch_results if r.status == "skipped"]
-
-    limitations: List[Dict[str, str]] = []
-    if seed_note:
-        limitations.append(seed_note)
-    for r in limited[:12]:
-        limitations.append({"source": r.source_name, "status": "受限", "note": r.note})
-    for r in failed[:12]:
-        limitations.append({"source": r.source_name, "status": "失败", "note": r.note})
-
-    citation_links = []
-    seen_url = set()
-    for f in findings:
-        if f.get("url") and f["url"] not in seen_url:
-            citation_links.append({"label": f.get("source") or f.get("theme"), "url": f["url"]})
-            seen_url.add(f["url"])
-        for it in f.get("supporting_items", [])[:3]:
-            u = it.get("url")
-            if u and u not in seen_url:
-                citation_links.append({"label": it.get("source") or it.get("title"), "url": u})
-                seen_url.add(u)
-    if not citation_links and seed.get("citation_links"):
-        citation_links = seed.get("citation_links", [])
-
-    stats = {
-        "total_sources": len(sources),
-        "due_sources": len(fetch_results),
-        "fetched_sources": len(fetched),
-        "partial_sources": len(partial),
-        "limited_sources": len(limited),
-        "failed_sources": len(failed),
-        "skipped_sources": len(skipped),
-        "raw_items": len(items),
-        "candidate": sum(1 for s in sources if s.get("是否候选") == "是"),
-        "sustainable": sum(1 for s in sources if s.get("是否可持续追踪") == "是"),
-        "daily": sum(1 for s in sources if "每日" in s.get("追踪频率", "")),
-        "weekly": sum(1 for s in sources if "每周" in s.get("追踪频率", "")),
-        "monthly": sum(1 for s in sources if "每月" in s.get("追踪频率", "")),
-        "low": sum(1 for s in sources if "低频" in s.get("追踪频率", "")),
-    }
-
-    return {
-        "generated_at": generated_at.strftime("%Y-%m-%d %H:%M Asia/Singapore"),
-        "generated_at_iso": generated_at.isoformat(),
-        "date": generated_at.strftime("%Y-%m-%d"),
-        "timezone": TZ_NAME,
-        "stats": stats,
-        "findings": findings,
-        "signals": signals,
-        "actions": actions,
-        "limitations": limitations,
-        "source_health": [r.__dict__ for r in fetch_results],
-        "sources": sources,
-        "raw_items": sorted(items, key=lambda x: (x.get("source_priority", 0), len(x.get("themes", []))), reverse=True)[:MAX_RAW_ITEMS],
-        "citation_links": citation_links[:60],
-        "method": {
-            "summary": "公开来源自动抓取 + 规则打分；若配置 OPENAI_API_KEY 且 OPENAI_MODEL 可启用 LLM 二次整合。",
-            "principles": ["最重要", "受众最关切", "行业最相关", "增长需求点"],
-        },
-    }
-
-
-def try_llm_enhance(data: Dict[str, Any]) -> Dict[str, Any]:
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    model = os.getenv("OPENAI_MODEL", "").strip()
-    if not api_key or not model:
-        return data
-
-    # This block is optional. If it fails, the deterministic dashboard remains valid.
-    try:
-        from openai import OpenAI  # type: ignore
-
-        client = OpenAI(api_key=api_key)
-        items = data.get("raw_items", [])[:80]
-        prompt = {
-            "role": "system",
-            "content": (
-                "你是 VPN 行业增长情报分析师。请只输出 JSON，不要 Markdown。"
-                "根据输入的公开来源条目，按四个原则：最重要、受众最关切、行业最相关、增长需求点，"
-                "生成中文日报面板字段：findings, signals, actions。"
-            ),
-        }
-        user = {
-            "role": "user",
-            "content": json.dumps(
-                {
-                    "current_stats": data.get("stats"),
-                    "existing_findings": data.get("findings", [])[:10],
-                    "raw_items": [
-                        {
-                            "title": x.get("title"),
-                            "source": x.get("source"),
-                            "url": x.get("url"),
-                            "snippet": x.get("snippet"),
-                            "themes": x.get("themes"),
-                            "metrics": x.get("metrics"),
-                        }
-                        for x in items
-                    ],
-                    "required_schema": {
-                        "findings": "array of {priority,theme,title,source,url,evidence,audience,impact,industry,growth,action,tags}",
-                        "signals": "array of {name,heat,confidence,direction,owner,item_count}",
-                        "actions": "array of {lane,task,why,priority}",
-                    },
-                },
-                ensure_ascii=False,
-            )[:120000],
-        }
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[prompt, user],
-            temperature=0.2,
+        link = ""
+        link_tag = entry.find("link")
+        if link_tag:
+            link = clean_text(link_tag.get("href") or link_tag.get_text())
+        snippet = clean_text(entry.find_text("summary") or entry.find_text("description") or entry.find_text("content"))[:520]
+        published = clean_text(entry.find_text("updated") or entry.find_text("published") or entry.find_text("pubDate"))
+        items.append(
+            {
+                "title": title,
+                "snippet": snippet,
+                "url": link or feed_url,
+                "published_at": to_iso(parse_datetime(published)) if published else "",
+                "source_name": row.get("来源名称", "Reddit"),
+                "platform": "Reddit",
+                "source_category": row.get("来源类别", "社区"),
+                "fetch_method": "reddit_rss",
+            }
         )
-        text = resp.choices[0].message.content or ""
-        text = text.strip()
-        if text.startswith("```"):
-            text = re.sub(r"^```(?:json)?\s*", "", text)
-            text = re.sub(r"\s*```$", "", text)
-        enhanced = json.loads(text)
-        for key in ["findings", "signals", "actions"]:
-            if isinstance(enhanced.get(key), list) and enhanced[key]:
-                data[key] = enhanced[key]
-        data["method"]["llm_enhanced"] = True
-        data["method"]["llm_model"] = model
-        return data
+    return items
+
+
+def parse_old_reddit_html(text: str, row: Dict[str, str], page_url: str) -> List[Dict[str, Any]]:
+    soup = BeautifulSoup(text, "html.parser")
+    items: List[Dict[str, Any]] = []
+    for thing in soup.select("div.thing")[:MAX_ITEMS_PER_SOURCE]:
+        a = thing.select_one("a.title")
+        if not a:
+            continue
+        title = clean_text(a.get_text(" "))
+        href = clean_text(a.get("href"))
+        if href.startswith("/"):
+            href = "https://www.reddit.com" + href
+        comments = thing.select_one("a.comments")
+        if comments and comments.get("href"):
+            href = clean_text(comments.get("href"))
+        time_tag = thing.select_one("time") or thing.select_one(".live-timestamp")
+        published = ""
+        if time_tag:
+            parsed = parse_datetime(time_tag.get("datetime") or time_tag.get("title") or time_tag.get_text(" "))
+            published = to_iso(parsed) if parsed else ""
+        items.append(
+            {
+                "title": title,
+                "snippet": clean_text(thing.get_text(" "))[:520],
+                "url": href or page_url,
+                "published_at": published,
+                "source_name": row.get("来源名称", "Reddit"),
+                "platform": "Reddit",
+                "source_category": row.get("来源类别", "社区"),
+                "fetch_method": "old_reddit_html",
+            }
+        )
+    return items
+
+
+def fetch_reddit(row: Dict[str, str]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    url = row.get("URL/入口", "")
+    candidates = reddit_candidate_urls(url)
+    errors: List[str] = []
+    try:
+        token = get_reddit_token()
     except Exception as exc:
-        data.setdefault("limitations", []).insert(
-            0,
-            {"source": "LLM 二次整合", "status": "回退到规则引擎", "note": f"{type(exc).__name__}: {exc}"},
+        token = None
+        errors.append(f"oauth_token: {str(exc)[:120]}")
+    if token:
+        for api_url in candidates.get("oauth", []):
+            try:
+                resp = fetch_url(api_url, accept_json=True, reddit=True, bearer=token)
+                items = parse_reddit_json(resp.json(), row, api_url)
+                if items:
+                    return items, {"status": "ok", "fetched": len(items), "method": "reddit_oauth", "url": api_url}
+                errors.append("oauth: empty")
+            except Exception as exc:
+                errors.append(f"oauth: {str(exc)[:120]}")
+    for json_url in candidates.get("json", []):
+        try:
+            resp = fetch_url(json_url, accept_json=True, reddit=True)
+            items = parse_reddit_json(resp.json(), row, json_url)
+            if items:
+                return items, {"status": "ok", "fetched": len(items), "method": "reddit_public_json", "url": json_url}
+            errors.append("public_json: empty")
+        except Exception as exc:
+            errors.append(f"public_json: {str(exc)[:120]}")
+    for rss_url in candidates.get("rss", []):
+        try:
+            resp = fetch_url(rss_url, reddit=True)
+            items = parse_reddit_rss(resp.text, row, rss_url)
+            if items:
+                return items, {"status": "ok", "fetched": len(items), "method": "reddit_rss", "url": rss_url}
+            errors.append("rss: empty")
+        except Exception as exc:
+            errors.append(f"rss: {str(exc)[:120]}")
+    for old_url in candidates.get("old_html", []):
+        try:
+            resp = fetch_url(old_url, reddit=True)
+            items = parse_old_reddit_html(resp.text, row, old_url)
+            if items:
+                return items, {"status": "ok", "fetched": len(items), "method": "old_reddit_html", "url": old_url}
+            errors.append("old_html: empty")
+        except Exception as exc:
+            errors.append(f"old_html: {str(exc)[:120]}")
+    reason = " | ".join(errors[:5]) or "所有 Reddit 兜底路径均无内容"
+    return [], {"status": "failed", "reason": reason[:360], "method": "reddit_multifallback", "url": url}
+
+
+def useful_title(text: str) -> bool:
+    text = clean_text(text)
+    if len(text) < 14 or len(text) > 220:
+        return False
+    low = text.lower()
+    bad = {"privacy policy", "terms of service", "cookie policy", "log in", "login", "sign up", "subscribe", "menu", "home"}
+    return not any(low == b or low.startswith(b + " ") for b in bad)
+
+
+def extract_web_items(row: Dict[str, str], soup: BeautifulSoup, url: str) -> List[Dict[str, Any]]:
+    now = now_sg()
+    items: List[Dict[str, Any]] = []
+    page_date = extract_page_date(soup, now)
+    title = clean_text(soup.title.string if soup.title and soup.title.string else "")
+    desc_tag = soup.find("meta", attrs={"name": "description"}) or soup.find("meta", attrs={"property": "og:description"})
+    meta_desc = clean_text(desc_tag.get("content") if desc_tag and desc_tag.get("content") else "")
+
+    seen = set()
+    selectors = [
+        "article a[href]", "li a[href]", "h1 a[href]", "h2 a[href]", "h3 a[href]",
+        ".post a[href]", ".article a[href]", ".card a[href]", ".entry-title a[href]",
+    ]
+    for selector in selectors:
+        for link in soup.select(selector)[:90]:
+            text = clean_text(link.get_text(" "))
+            if not useful_title(text):
+                continue
+            href = clean_text(link.get("href"))
+            if not href or href.startswith("#") or href.lower().startswith("javascript"):
+                continue
+            href = urljoin(url, href)
+            key = (re.sub(r"\W+", "", text.lower())[:100], href.split("?")[0].rstrip("/"))
+            if key in seen:
+                continue
+            seen.add(key)
+            container = link.find_parent(["article", "li", "div", "section"]) or link.parent
+            item_dt = extract_item_date(container, page_date, now)
+            snippet = clean_text(container.get_text(" ") if container else meta_desc)[:520]
+            items.append(
+                {
+                    "title": text,
+                    "snippet": snippet or meta_desc or title,
+                    "url": href,
+                    "published_at": to_iso(item_dt),
+                    "source_name": row.get("来源名称", "Web"),
+                    "platform": row.get("平台", "Web"),
+                    "source_category": row.get("来源类别", "网页"),
+                    "fetch_method": "html_listing",
+                }
+            )
+            if len(items) >= MAX_ITEMS_PER_SOURCE:
+                return items
+    # Article/single-page fallback: only if page itself has a valid date.
+    h1 = soup.find("h1")
+    page_title = clean_text(h1.get_text(" ") if h1 else title)
+    if useful_title(page_title):
+        items.append(
+            {
+                "title": page_title[:220],
+                "snippet": meta_desc or clean_text(soup.get_text(" "))[:520],
+                "url": url,
+                "published_at": to_iso(page_date),
+                "source_name": row.get("来源名称", "Web"),
+                "platform": row.get("平台", "Web"),
+                "source_category": row.get("来源类别", "网页"),
+                "fetch_method": "html_page",
+            }
         )
-        data["method"]["llm_enhanced"] = False
-        return data
+    return items
 
 
-def priority_class(p: str) -> str:
-    return {"P0": "p0", "P1": "p1", "P2": "p2"}.get(p, "")
-
-
-def make_bar(value: Any) -> str:
+def fetch_x_official(row: Dict[str, str]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Fetch recent posts from an official X/Twitter account if X_BEARER_TOKEN is configured."""
+    url = row.get("URL/入口", "")
+    parsed = urlparse(url)
+    handle = parsed.path.strip("/").split("/")[0]
+    if not handle or handle.lower() in {"search", "i"}:
+        return [], {"status": "manual_required", "reason": "无法从 X/Twitter URL 识别官方账号 handle", "method": "x_recent_search_api"}
+    if not X_BEARER_TOKEN:
+        return [], {"status": "limited", "reason": "X/Twitter 官方账号需要 X_BEARER_TOKEN；未配置时不抓取，避免旧页面内容误入日报。", "method": "x_api_required"}
     try:
-        v = max(0, min(100, int(float(value))))
-    except Exception:
-        v = 0
-    return f'<span class="bar"><i style="width:{v}%"></i><b>{v}</b></span>'
+        endpoint = "https://api.twitter.com/2/tweets/search/recent"
+        params = {
+            "query": f"from:{handle} -is:retweet",
+            "max_results": str(max(10, min(100, MAX_ITEMS_PER_SOURCE))),
+            "tweet.fields": "created_at,public_metrics,lang",
+        }
+        headers = {"Authorization": f"Bearer {X_BEARER_TOKEN}", "User-Agent": USER_AGENT}
+        resp = SESSION.get(endpoint, params=params, headers=headers, timeout=HTTP_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json()
+        items: List[Dict[str, Any]] = []
+        for t in data.get("data", [])[:MAX_ITEMS_PER_SOURCE]:
+            text = clean_text(t.get("text"))
+            if not text:
+                continue
+            tid = clean_text(t.get("id"))
+            created = clean_text(t.get("created_at"))
+            metrics = t.get("public_metrics", {}) or {}
+            items.append({
+                "title": text[:180],
+                "snippet": text,
+                "url": f"https://x.com/{handle}/status/{tid}" if tid else url,
+                "published_at": to_iso(parse_datetime(created)),
+                "source_name": row.get("来源名称", f"X @{handle}"),
+                "platform": "X/Twitter",
+                "source_category": row.get("来源类别", "竞品官方社媒"),
+                "fetch_method": "x_recent_search_api",
+                "raw_score": safe_int(metrics.get("like_count"), 0),
+                "comments": safe_int(metrics.get("reply_count"), 0),
+            })
+        return items, {"status": "ok", "fetched": len(items), "method": "x_recent_search_api"}
+    except Exception as exc:
+        return [], {"status": "failed", "reason": str(exc)[:260], "method": "x_recent_search_api"}
+
+
+def fetch_youtube_light(row: Dict[str, str]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    url = row.get("URL/入口", "")
+    api_key = os.getenv("YOUTUBE_API_KEY", "").strip()
+    query = "best vpn uk"
+    parsed = urlparse(url)
+    params = dict(parse_qsl(parsed.query))
+    if params.get("search_query"):
+        query = params["search_query"].replace("+", " ")
+    if api_key:
+        try:
+            endpoint = (
+                "https://www.googleapis.com/youtube/v3/search"
+                f"?part=snippet&type=video&maxResults={MAX_ITEMS_PER_SOURCE}&order=date&q={quote_plus(query)}&key={api_key}"
+            )
+            resp = fetch_url(endpoint, accept_json=True)
+            data = resp.json()
+            items = []
+            for v in data.get("items", []):
+                sn = v.get("snippet", {})
+                vid = v.get("id", {}).get("videoId", "")
+                items.append(
+                    {
+                        "title": clean_text(sn.get("title")),
+                        "snippet": clean_text(sn.get("description"))[:520],
+                        "url": f"https://www.youtube.com/watch?v={vid}" if vid else url,
+                        "published_at": to_iso(parse_datetime(sn.get("publishedAt"))),
+                        "source_name": row.get("来源名称", "YouTube"),
+                        "platform": "YouTube",
+                        "source_category": row.get("来源类别", "视频"),
+                        "fetch_method": "youtube_api",
+                    }
+                )
+            return items, {"status": "ok", "fetched": len(items), "method": "youtube_api"}
+        except Exception as exc:
+            return [], {"status": "failed", "reason": str(exc)[:220], "method": "youtube_api"}
+    return [], {"status": "limited", "reason": "YouTube 搜索若需稳定发布时间与原视频链接，建议配置 YOUTUBE_API_KEY；未配置时不纳入重点，避免旧视频混入。", "method": "youtube_api_missing"}
+
+
+def fetch_web(row: Dict[str, str]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    url = row.get("URL/入口", "")
+    if SKIP_NETWORK:
+        return [], {"status": "skipped", "reason": "SKIP_NETWORK=1，仅生成预览", "method": "preview"}
+    if not url.startswith("http"):
+        return [], {"status": "manual_required", "reason": "没有可直接抓取的公开 URL"}
+    platform = row.get("平台", "").lower()
+    name = row.get("来源名称", "").lower()
+    if "twitter" in platform or "x 搜索" in name or "x.com" in url or "twitter.com" in url:
+        if source_taxonomy(row) == "社交媒体":
+            return fetch_x_official(row)
+        return [], {"status": "limited", "reason": "X/Twitter 泛搜索需要官方 API/监听工具或手工补充；未抓取时不生成旧信息。", "method": "x_api_required"}
+    if "tiktok" in platform or "tiktok.com" in url:
+        return [], {"status": "limited", "reason": "TikTok 搜索页反爬较强；建议用 manual_inputs.csv 补充当天官方贴。", "method": "tiktok_manual"}
+    if "youtube" in platform or "youtube.com/results" in url:
+        return fetch_youtube_light(row)
+    if "reddit.com" in url or "old.reddit.com" in url:
+        return fetch_reddit(row)
+    try:
+        resp = fetch_url(url)
+        ctype = resp.headers.get("content-type", "")
+        if "json" in ctype:
+            data = resp.json()
+            title = clean_text(data.get("title") if isinstance(data, dict) else row.get("来源名称"))
+            published = ""
+            if isinstance(data, dict):
+                for key in ["published_at", "publishedAt", "datePublished", "dateModified", "updated_at"]:
+                    parsed = parse_datetime(data.get(key))
+                    if parsed:
+                        published = to_iso(parsed)
+                        break
+            return [
+                {
+                    "title": title or row.get("来源名称", url),
+                    "snippet": clean_text(str(data))[:520],
+                    "url": url,
+                    "published_at": published,
+                    "source_name": row.get("来源名称", "Web"),
+                    "platform": row.get("平台", "Web"),
+                    "source_category": row.get("来源类别", "网页"),
+                    "fetch_method": "json",
+                }
+            ], {"status": "ok", "fetched": 1, "method": "json"}
+        soup = BeautifulSoup(resp.text, "html.parser")
+        items = extract_web_items(row, soup, resp.url)
+        return items, {"status": "ok", "fetched": len(items), "method": "html", "url": resp.url}
+    except Exception as exc:
+        return [], {"status": "failed", "reason": str(exc)[:260], "method": "html"}
+
+
+def read_manual_inputs(today: dt.date) -> List[Dict[str, Any]]:
+    rows = read_csv_dicts(MANUAL_CSV)
+    items: List[Dict[str, Any]] = []
+    for row in rows:
+        title = clean_text(row.get("标题"))
+        source_label = clean_text(row.get("来源"))
+        if not title or "示例" in title or "example.com" in clean_text(row.get("链接")):
+            continue
+        date_text = clean_text(row.get("发布时间") or row.get("日期")) or today.isoformat()
+        parsed = parse_datetime(date_text)
+        date_iso = to_iso(parsed) if parsed else today.isoformat()
+        if parsed and to_sg(parsed).date() != today:
+            continue
+        items.append(
+            {
+                "title": title,
+                "snippet": clean_text(row.get("摘要")),
+                "url": clean_text(row.get("链接")) or "#",
+                "published_at": date_iso,
+                "source_name": source_label or "手工补充",
+                "platform": "Manual",
+                "source_category": "手工补充",
+                "manual_subcategory": clean_text(row.get("子分类") or row.get("主题")),
+                "manual_score": clean_text(row.get("重要性分")),
+                "manual_taxonomy": clean_text(row.get("信息类别") or row.get("面板类别") or row.get("分类") or row.get("情报大类")),
+                "fetch_method": "manual_inputs",
+            }
+        )
+    return items
+
+
+def enrich_item(item: Dict[str, Any], source_lookup: Dict[str, Dict[str, str]]) -> Dict[str, Any]:
+    source_name = item.get("source_name", "")
+    row = source_lookup.get(source_name, {})
+    combined = " ".join(
+        [
+            clean_text(item.get("title")),
+            clean_text(item.get("snippet")),
+            clean_text(row.get("来源名称")),
+            clean_text(row.get("备注")),
+            clean_text(row.get("关键信息")),
+            clean_text(row.get("信息价值")),
+            clean_text(row.get("情报大类")),
+            clean_text(row.get("URL/入口")),
+        ]
+    )
+    category = normalize_category(item.get("manual_taxonomy")) or guess_category_from_item(item, row)
+    if category not in TAXONOMY_ORDER:
+        category = "第三方网站"
+    issue, issue_hits = classify_issue(combined)
+    subcategory, sub_hits = infer_subcategory(category, combined)
+    if item.get("manual_subcategory"):
+        subcategory = item["manual_subcategory"]
+    base = source_priority(row) or 5
+    layer_bonus = 8 if "核心" in row.get("日报层级", "") else 4 if "周更" in row.get("日报层级", "") else 0
+    freq_bonus = 5 if "每日" in row.get("追踪频率", "") else 2 if "每周" in row.get("追踪频率", "") else 0
+    engagement_bonus = min(8, safe_int(item.get("comments"), 0) // 5) + min(5, safe_int(item.get("raw_score"), 0) // 10)
+    issue_bonus = min(14, (len(issue_hits) + len(sub_hits)) * 3)
+    source_type_bonus = {"政策风险": 10, "reddit讨论": 8, "竞品动态": 8, "社交媒体": 6, "第三方网站": 5}.get(category, 4)
+    manual_score = safe_int(item.get("manual_score"), 0)
+    score = manual_score or min(99, 36 + base * 4 + layer_bonus + freq_bonus + engagement_bonus + issue_bonus + source_type_bonus)
+    age = item_age_days(item)
+    current_ok, current_reason = is_current_item({**item, "intelligence_category": category})
+    item.update(
+        {
+            "intelligence_category": category,
+            "subcategory": subcategory,
+            "issue": issue,
+            "matched_keywords": list(dict.fromkeys(issue_hits + sub_hits))[:10],
+            "importance_score": int(score),
+            "priority": priority_label(score),
+            "audience": row.get("目标用户", "public") or "public",
+            "source_note": row.get("备注", ""),
+            "source_strategy": row.get("采集策略", ""),
+            "evidence_role": row.get("证据角色", ""),
+            "age_days": round(age, 2) if age is not None else None,
+            "age_label": age_label(age),
+            "freshness_window_days": freshness_window(category),
+            "freshness_window_label": freshness_window_label(category),
+            "freshness_window_hours": freshness_window_hours(category),
+            "is_current": current_ok,
+            "freshness_reason": current_reason,
+        }
+    )
+    return item
+
+
+def dedupe_items(items: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen = set()
+    out = []
+    for item in items:
+        title_key = re.sub(r"\W+", "", clean_text(item.get("title", "")).lower())[:120]
+        url_key = clean_text(item.get("url", "")).lower().split("?")[0].rstrip("/")
+        key = url_key or title_key
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
+def filter_current_items(items: List[Dict[str, Any]], now: dt.datetime) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    current: List[Dict[str, Any]] = []
+    filtered: List[Dict[str, Any]] = []
+    for item in items:
+        ok, reason = is_current_item(item, now)
+        item["is_current"] = ok
+        item["freshness_reason"] = reason
+        if ok:
+            current.append(item)
+        else:
+            filtered.append(item)
+    return current, filtered
+
+
+def normalized_issue_key(text: str) -> str:
+    low = text.lower()
+    for key, kws in [
+        ("policy-age-assurance", ["age assurance", "age verification", "under-16", "under 16", "online safety", "ofcom", "ico", "children"]),
+        ("streaming-detection", ["netflix", "iplayer", "streaming", "geo", "geoblock", "detected", "unblock"]),
+        ("pricing-refund-cancel", ["price", "pricing", "refund", "cancel", "renewal", "subscription", "coupon", "deal"]),
+        ("performance-connection", ["slow", "speed", "latency", "disconnect", "server", "captcha", "ip reputation", "blocked"]),
+        ("privacy-audit", ["privacy", "no-log", "no logs", "audit", "transparency", "webrtc", "dns leak", "leak"]),
+        ("product-update", ["release", "feature", "update", "app", "protocol", "extension"]),
+        ("review-ranking", ["best vpn", "review", "ranking", "comparison", "top vpn", "guide"]),
+        ("public-wifi-travel-student", ["wifi", "wi-fi", "airport", "hotel", "travel", "student", "university", "uni"]),
+    ]:
+        if any(k in low for k in kws):
+            return key
+    tokens = re.findall(r"[a-z][a-z0-9_-]{2,}|[\u4e00-\u9fff]{2,}", low)
+    tokens = [t for t in tokens if t not in STOP_WORDS][:8]
+    return "generic-" + "-".join(tokens[:4]) if tokens else "generic"
+
+
+def cluster_key(item: Dict[str, Any]) -> str:
+    text = " ".join([item.get("title", ""), item.get("snippet", ""), item.get("source_name", "")])
+    return f"{item.get('intelligence_category')}::{item.get('subcategory')}::{normalized_issue_key(text)}"
+
+
+def make_finding_title(category: str, subcategory: str, issue: str, examples: List[Dict[str, Any]]) -> str:
+    if examples:
+        top_title = clean_text(examples[0].get("title"))
+        if top_title:
+            return f"{subcategory}｜{top_title[:110]}"
+    return f"{subcategory}｜{issue or category}"
+
+
+def build_source_links(items: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    seen = set()
+    out: List[Dict[str, str]] = []
+    for item in items:
+        url = clean_text(item.get("url"))
+        if not url or url == "#" or url in seen:
+            continue
+        seen.add(url)
+        out.append(
+            {
+                "title": clean_text(item.get("title"))[:140],
+                "url": url,
+                "source": clean_text(item.get("source_name")),
+                "published_at": format_date(item.get("published_at")),
+                "age": clean_text(item.get("age_label")),
+                "method": clean_text(item.get("fetch_method")),
+            }
+        )
+    return out
+
+
+def build_findings(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    clusters: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for item in items:
+        clusters[cluster_key(item)].append(item)
+    findings: List[Dict[str, Any]] = []
+    for _, group in clusters.items():
+        group_sorted = sorted(group, key=lambda x: (x.get("importance_score", 0), -float(x.get("age_days") or 999)), reverse=True)
+        top = group_sorted[0]
+        category = top.get("intelligence_category", "第三方网站")
+        subcategory = top.get("subcategory", "综合观察")
+        issue = top.get("issue", "综合观察")
+        avg_score = sum(int(x.get("importance_score", 0)) for x in group_sorted[:6]) / max(1, min(6, len(group_sorted)))
+        source_names = sorted({clean_text(x.get("source_name")) for x in group_sorted if x.get("source_name")})
+        source_links = build_source_links(group_sorted)
+        evidence = "；".join(dict.fromkeys([clean_text(x.get("title"))[:120] for x in group_sorted[:5] if x.get("title")]))
+        dates = [parse_datetime(x.get("published_at")) for x in group_sorted if parse_datetime(x.get("published_at"))]
+        latest = max(dates) if dates else None
+        earliest = min(dates) if dates else None
+        tags: List[str] = []
+        for x in group_sorted:
+            tags.extend(x.get("matched_keywords") or [])
+            if x.get("issue"):
+                tags.append(x.get("issue"))
+            if x.get("subcategory"):
+                tags.append(x.get("subcategory"))
+        findings.append(
+            {
+                "priority": priority_label(avg_score + min(6, len(source_links) * 2)),
+                "category": category,
+                "subcategory": subcategory,
+                "issue": issue,
+                "title": make_finding_title(category, subcategory, issue, group_sorted),
+                "evidence": evidence,
+                "source_count": len(source_links),
+                "source_names": source_names,
+                "source_links": source_links,
+                "url": source_links[0]["url"] if source_links else top.get("url", "#"),
+                "latest_published_at": to_iso(latest),
+                "earliest_published_at": to_iso(earliest),
+                "freshness": f"最新 {format_date(to_iso(latest)) if latest else '未确认'}；窗口 {freshness_window_hours(category)} 小时",
+                "importance_score": int(avg_score),
+                "tags": [t for t, _ in Counter(tags).most_common(8)],
+                "items": group_sorted[:12],
+            }
+        )
+    rank = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
+    findings.sort(key=lambda x: (TAXONOMY_ORDER.index(x.get("category")) if x.get("category") in TAXONOMY_ORDER else 99, rank.get(x.get("priority", "P3"), 9), -x.get("source_count", 0), -x.get("importance_score", 0)))
+    # Keep balanced coverage: top clusters per category.
+    balanced: List[Dict[str, Any]] = []
+    for cat in TAXONOMY_ORDER:
+        balanced.extend([f for f in findings if f.get("category") == cat][:5])
+    return balanced[:24]
+
+
+def build_category_panels(items: List[Dict[str, Any]], sources: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+    item_counts = Counter(x.get("intelligence_category", "第三方网站") for x in items)
+    source_counts = Counter(source_taxonomy(s) for s in sources)
+    panels = []
+    for cat in TAXONOMY_ORDER:
+        group = [x for x in items if x.get("intelligence_category") == cat]
+        avg = int(sum(int(x.get("importance_score", 0)) for x in group) / len(group)) if group else 0
+        subcats = Counter(x.get("subcategory", "综合") for x in group).most_common(5)
+        panels.append(
+            {
+                "name": cat,
+                "definition": TAXONOMY_META[cat]["definition"],
+                "examples": TAXONOMY_META[cat]["examples"],
+                "items": item_counts.get(cat, 0),
+                "sources": source_counts.get(cat, 0),
+                "heat": avg,
+                "priority": priority_label(avg) if group else "无新信息",
+                "subcategories": subcats,
+                "freshness_days": freshness_window(cat),
+                "freshness_label": freshness_window_label(cat),
+                "freshness_hours": freshness_window_hours(cat),
+            }
+        )
+    return panels
+
+
+def build_stats(sources: List[Dict[str, str]], current_items: List[Dict[str, Any]], raw_items: List[Dict[str, Any]], filtered_items: List[Dict[str, Any]], statuses: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return {
+        "total_sources": len(sources),
+        "monitored_sources": sum(1 for s in sources if include_source(s)),
+        "current_items": len(current_items),
+        "raw_items": len(raw_items),
+        "filtered_items": len(filtered_items),
+        "sources_ok": sum(1 for s in statuses if s.get("status") == "ok"),
+        "sources_limited": sum(1 for s in statuses if s.get("status") in {"limited", "manual_required", "skipped"}),
+        "sources_failed": sum(1 for s in statuses if s.get("status") == "failed"),
+        "reddit_oauth_ready": bool(os.getenv("REDDIT_CLIENT_ID") and os.getenv("REDDIT_CLIENT_SECRET")),
+        "x_api_ready": bool(X_BEARER_TOKEN),
+        "freshness_windows": {cat: f"{freshness_window_hours(cat)}小时" for cat in TAXONOMY_ORDER},
+        "freshness_hours": FRESHNESS_HOURS,
+        "freshness_days": FRESHNESS_DAYS,
+    }
+
+
+def build_limitations(statuses: List[Dict[str, Any]], filtered_items: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    limited = [s for s in statuses if s.get("status") in {"limited", "manual_required", "failed", "skipped"}]
+    out = []
+    for s in limited[:18]:
+        source = clean_text(s.get("source_name"))
+        reason = clean_text(s.get("reason")) or "抓取受限或暂无新内容"
+        method = clean_text(s.get("method"))
+        if "reddit" in method or "reddit" in clean_text(s.get("url")).lower():
+            next_step = "已内置 OAuth/public JSON/RSS/old.reddit 兜底；若仍失败，配置 Reddit Secrets 或当天手工补原帖链接。"
+        elif "x_" in method or "twitter" in reason.lower():
+            next_step = "社交媒体官方账号建议接官方 API，或把当天官方帖粘到 manual_inputs.csv。"
+        else:
+            next_step = "换成 RSS/API/具体文章页，或在 manual_inputs.csv 手工补当天线索。"
+        out.append({"source": source, "status": clean_text(s.get("status")), "method": method, "reason": reason, "next_step": next_step})
+    filtered_counter = Counter(clean_text(x.get("freshness_reason")) for x in filtered_items)
+    for reason, count in filtered_counter.most_common(8):
+        out.append({"source": f"时效过滤 {count} 条", "status": "filtered", "method": "freshness_guard", "reason": reason, "next_step": f"不会进入重点卡；如需放宽，调整 .github/workflows/daily-update.yml 中 DASHBOARD_LOOKBACK_HOURS。"})
+    return out[:30]
+
+
+def sanitize_filtered_items(filtered_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Keep only metadata for hidden stale/undated items so old titles do not resurface in the panel or JSON."""
+    return [
+        {
+            "source_name": clean_text(x.get("source_name")),
+            "intelligence_category": clean_text(x.get("intelligence_category")),
+            "published_at": clean_text(x.get("published_at")),
+            "freshness_reason": clean_text(x.get("freshness_reason")),
+            "age_label": clean_text(x.get("age_label")),
+        }
+        for x in filtered_items
+    ]
+
+
+def keyword_cloud(items: List[Dict[str, Any]]) -> List[Tuple[str, int]]:
+    text = " ".join([clean_text(x.get("title", "")) + " " + clean_text(x.get("snippet", "")) for x in items])
+    words = re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}|[\u4e00-\u9fff]{2,}", text.lower())
+    counter = Counter(w for w in words if w not in STOP_WORDS and len(w) <= 28)
+    return counter.most_common(30)
+
+
+def citation_links(findings: List[Dict[str, Any]], items: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    seen = set()
+    out: List[Dict[str, str]] = []
+    for f in findings:
+        for link in f.get("source_links", []):
+            url = clean_text(link.get("url"))
+            if url.startswith("http") and url not in seen:
+                out.append({"label": f"{link.get('source')}｜{link.get('title')}", "url": url, "role": f.get("category", "")})
+                seen.add(url)
+    for it in items[:80]:
+        url = clean_text(it.get("url"))
+        if url.startswith("http") and url not in seen:
+            out.append({"label": clean_text(it.get("source_name")) + "｜" + clean_text(it.get("title"))[:80], "url": url, "role": it.get("intelligence_category", "")})
+            seen.add(url)
+    return out[:120]
+
+
+def render_source_links(links: List[Dict[str, str]]) -> str:
+    if not links:
+        return "<p class='muted'>无可用原始链接</p>"
+    rows = []
+    for link in links:
+        title = html.escape(clean_text(link.get("title")))
+        url = html.escape(clean_text(link.get("url")))
+        source = html.escape(clean_text(link.get("source")))
+        date = html.escape(clean_text(link.get("published_at")))
+        age = html.escape(clean_text(link.get("age")))
+        rows.append(f"<li><a href='{url}' target='_blank' rel='noreferrer'>{title}</a><small>{source} · {date} · {age}</small></li>")
+    return "<ol class='sourceList'>" + "".join(rows) + "</ol>"
+
+
+def render_finding_card(f: Dict[str, Any]) -> str:
+    def esc(x: Any) -> str:
+        return html.escape(clean_text(x))
+    p = esc(f.get("priority", "P2"))
+    cls = p.lower()
+    tags = "".join(f"<span>{esc(t)}</span>" for t in (f.get("tags") or [])[:8])
+    links_html = render_source_links(f.get("source_links", []))
+    return f"""
+    <article class="card {cls}">
+      <div class="meta"><span class="pill {cls}">{p}</span><span class="pill">{esc(f.get('category'))}</span><span class="pill">{esc(f.get('subcategory'))}</span><span class="pill">{esc(f.get('source_count'))} 个来源</span></div>
+      <h3><a href="{esc(f.get('url'))}" target="_blank" rel="noreferrer">{esc(f.get('title'))}</a></h3>
+      <p><b>统一要点：</b>{esc(f.get('evidence'))}</p>
+      <p><b>时效：</b>{esc(f.get('freshness'))}</p>
+      <div class="tags">{tags}</div>
+      <h4>原始信息源</h4>
+      {links_html}
+    </article>
+    """
 
 
 def render_html(data: Dict[str, Any]) -> str:
-    j = json.dumps(data, ensure_ascii=False)
+    generated_at = html.escape(data.get("generated_at", ""))
     stats = data.get("stats", {})
     findings = data.get("findings", [])
-    signals = data.get("signals", [])
-    actions = data.get("actions", [])
-    source_health = data.get("source_health", [])
-    raw_items = data.get("raw_items", [])
+    items = data.get("items", [])
+    filtered_items = data.get("filtered_items", [])
     limitations = data.get("limitations", [])
     sources = data.get("sources", [])
-    generated = data.get("generated_at", "")
-    date_text = data.get("date", "")
+    kw = data.get("keyword_cloud", [])
+    categories = data.get("category_panels", [])
+    links = data.get("citation_links", [])
 
-    finding_cards = []
-    for f in findings:
-        scores = (
-            f'<div class="scores"><label>重要性 {make_bar(f.get("impact", 0))}</label>'
-            f'<label>行业相关 {make_bar(f.get("industry", 0))}</label>'
-            f'<label>增长价值 {make_bar(f.get("growth", 0))}</label></div>'
-        )
-        tags = "".join(f"<span>{html.escape(str(t))}</span>" for t in f.get("tags", []))
-        support = ""
-        for it in f.get("supporting_items", [])[:3]:
-            support += f'<li><a href="{html.escape(it.get("url",""))}" target="_blank" rel="noopener">{html.escape(clean_text(it.get("title",""), 96))}</a> <em>{html.escape(it.get("source",""))}</em></li>'
-        if support:
-            support = f"<details><summary>查看支撑条目</summary><ul>{support}</ul></details>"
-        finding_cards.append(
-            f"""
-            <article class="card finding" data-priority="{html.escape(f.get("priority",""))}" data-search="{html.escape(json.dumps(f, ensure_ascii=False).lower())}">
-              <div class="card-top"><span class="pill {priority_class(f.get("priority",""))}">{html.escape(f.get("priority",""))}</span><span class="theme">{html.escape(f.get("theme",""))}</span><span class="score">综合 {(f.get("impact",0)+f.get("industry",0)+f.get("growth",0))//3}</span></div>
-              <h3><a href="{html.escape(f.get("url",""))}" target="_blank" rel="noopener">{html.escape(f.get("title",""))}</a></h3>
-              <p class="evidence">{html.escape(f.get("evidence",""))}</p>
-              <p class="audience"><b>受众：</b>{html.escape(f.get("audience",""))}</p>
-              {scores}
-              <p class="action"><b>建议动作：</b>{html.escape(f.get("action",""))}</p>
-              {support}
-              <div class="tags">{tags}</div>
-            </article>
-            """
-        )
+    def esc(x: Any) -> str:
+        return html.escape(clean_text(x))
 
-    signal_rows = []
-    for s in signals:
-        signal_rows.append(
-            f'<tr><td>{html.escape(s.get("name",""))}</td><td>{make_bar(s.get("heat",0))}</td><td>{make_bar(s.get("confidence",0))}</td><td>{html.escape(str(s.get("direction","")))}</td><td>{html.escape(s.get("owner",""))}</td><td>{html.escape(str(s.get("item_count","")))}</td></tr>'
-        )
+    stat_cards = "".join(
+        f"<div class='stat'><b>{esc(v)}</b><span>{esc(k)}</span></div>"
+        for k, v in [
+            ("信息源总数", stats.get("total_sources", 0)),
+            ("本次监控", stats.get("monitored_sources", 0)),
+            ("当前有效信息", stats.get("current_items", 0)),
+            ("原始抓取", stats.get("raw_items", 0)),
+            ("过滤旧/无日期", stats.get("filtered_items", 0)),
+            ("受限/失败来源", stats.get("sources_limited", 0) + stats.get("sources_failed", 0)),
+        ]
+    )
+    reddit_note = "已配置 Reddit OAuth" if stats.get("reddit_oauth_ready") else "未配置 Reddit OAuth，使用 public JSON/RSS/old.reddit 兜底；仍失败时走 manual_inputs.csv"
+    x_note = "X API 已配置" if stats.get("x_api_ready") else "X API 未配置，官方社媒需手工补充或配置 X_BEARER_TOKEN"
 
-    action_cards = []
-    for a in actions:
-        action_cards.append(
-            f"""
-            <div class="action-card">
-              <div><span class="pill {priority_class(a.get("priority",""))}">{html.escape(a.get("priority",""))}</span><b>{html.escape(a.get("lane",""))}</b></div>
-              <p>{html.escape(a.get("task",""))}</p>
-              <small>{html.escape(a.get("why",""))}</small>
-            </div>
-            """
-        )
+    category_cards = "".join(
+        f"<article class='taxonomy'><div class='taxHead'><b>{esc(c.get('name'))}</b><span>{esc(c.get('priority'))}</span></div><p>{esc(c.get('definition'))}</p><small>{esc(c.get('examples'))}</small><div class='taxNums'><i>来源 {esc(c.get('sources'))}</i><i>当前信息 {esc(c.get('items'))}</i><i>窗口 {esc(c.get('freshness_hours'))} 小时</i></div></article>"
+        for c in categories
+    )
+    finding_cards = "".join(render_finding_card(f) for f in findings) or "<div class='empty'>当前时效窗口内没有抓到可确认发布时间的新信息。旧信息和无日期信息不会进入重点卡。</div>"
+    keywords_html = "".join(f"<span>{esc(k)} · {v}</span>" for k, v in kw) or "<span>暂无关键词</span>"
+    item_rows = "".join(
+        f"<tr><td><a href='{esc(it.get('url'))}' target='_blank' rel='noreferrer'>{esc(it.get('title'))}</a><small>{esc(it.get('snippet'))}</small></td><td>{esc(it.get('source_name'))}<small>{esc(it.get('fetch_method'))}</small></td><td>{esc(it.get('intelligence_category'))}<small>{esc(it.get('subcategory'))}｜{esc(it.get('issue'))}</small></td><td>{esc(format_date(it.get('published_at')))}<small>{esc(it.get('age_label'))}；窗口 {esc(it.get('freshness_window_hours'))} 小时</small></td><td><b>{esc(it.get('priority'))}</b><br>{esc(it.get('importance_score'))}</td></tr>"
+        for it in items[:120]
+    ) or "<tr><td colspan='5'>当前时效窗口内暂无有效条目。</td></tr>"
+    filtered_summary = Counter(clean_text(it.get("freshness_reason")) or "其他原因" for it in filtered_items)
+    filtered_rows = "".join(
+        f"<tr><td>{esc(reason)}</td><td>{esc(count)}</td></tr>"
+        for reason, count in filtered_summary.most_common(12)
+    ) or "<tr><td colspan='2'>没有被过滤的旧信息或无日期信息。</td></tr>"
+    limitation_rows = "".join(
+        f"<tr><td>{esc(l.get('source'))}</td><td>{esc(l.get('status'))}<small>{esc(l.get('method'))}</small></td><td>{esc(l.get('reason'))}</td><td>{esc(l.get('next_step'))}</td></tr>"
+        for l in limitations
+    ) or "<tr><td colspan='4'>暂无受限来源。</td></tr>"
+    source_rows = "".join(
+        f"<tr><td><a href='{esc(s.get('URL/入口'))}' target='_blank' rel='noreferrer'>{esc(s.get('来源名称'))}</a><small>{esc(s.get('备注'))}</small></td><td>{esc(source_taxonomy(s))}</td><td>{esc(s.get('平台'))}</td><td>{esc(s.get('追踪频率'))}</td><td>{esc(s.get('日报层级'))}</td><td>{esc(s.get('采集策略'))}</td></tr>"
+        for s in sources[:220]
+    )
+    link_rows = "".join(
+        f"<tr><td>{esc(l.get('label'))}</td><td>{esc(l.get('role'))}</td><td><a href='{esc(l.get('url'))}' target='_blank' rel='noreferrer'>{esc(l.get('url'))}</a></td></tr>"
+        for l in links
+    ) or "<tr><td colspan='3'>当前没有证据链接。</td></tr>"
+    windows = stats.get("freshness_windows", {})
+    window_text = "；".join(f"{k} {v}" for k, v in windows.items())
 
-    health_rows = []
-    for r in source_health:
-        cls = r.get("status", "")
-        health_rows.append(
-            f'<tr class="{html.escape(cls)}"><td>{html.escape(r.get("source_name",""))}</td><td>{html.escape(r.get("platform",""))}</td><td>{html.escape(r.get("status",""))}</td><td>{html.escape(str(r.get("item_count","")))}</td><td>{html.escape(str(r.get("elapsed_ms","")))}</td><td>{html.escape(r.get("note",""))}</td></tr>'
-        )
-
-    raw_rows = []
-    for it in raw_items[:120]:
-        theme_text = ", ".join(t.get("id", "") for t in it.get("themes", [])[:2])
-        raw_rows.append(
-            f'<tr data-search="{html.escape(json.dumps(it, ensure_ascii=False).lower())}"><td>{html.escape(it.get("source",""))}</td><td>{html.escape(it.get("platform",""))}</td><td><a href="{html.escape(it.get("url",""))}" target="_blank" rel="noopener">{html.escape(clean_text(it.get("title",""), 110))}</a><br><small>{html.escape(clean_text(it.get("snippet",""), 160))}</small></td><td>{html.escape(theme_text)}</td><td>{html.escape(str(it.get("source_priority","")))}</td></tr>'
-        )
-
-    source_rows = []
-    for s in sources:
-        source_rows.append(
-            f'<tr data-tier="{html.escape(s.get("日报层级",""))}" data-search="{html.escape(json.dumps(s, ensure_ascii=False).lower())}"><td>{html.escape(s.get("来源类别",""))}</td><td>{html.escape(s.get("平台",""))}</td><td>{html.escape(s.get("来源名称",""))}</td><td><a href="{html.escape(s.get("URL/入口",""))}" target="_blank" rel="noopener">{html.escape(clean_text(s.get("URL/入口",""),80))}</a></td><td>{html.escape(s.get("追踪频率",""))}</td><td>{html.escape(s.get("日报层级",""))}</td><td>{html.escape(str(s.get("监控优先级分","")))}</td><td>{html.escape(s.get("备注",""))}</td></tr>'
-        )
-
-    limitation_rows = []
-    for l in limitations:
-        limitation_rows.append(f'<li><b>{html.escape(l.get("source",""))}</b>：{html.escape(l.get("status",""))} — {html.escape(l.get("note",""))}</li>')
-
-    citations = []
-    for c in data.get("citation_links", [])[:50]:
-        citations.append(f'<li><a href="{html.escape(c.get("url",""))}" target="_blank" rel="noopener">{html.escape(c.get("label",""))}</a></li>')
-
-    html_doc = f"""<!doctype html>
+    return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>VPN UK 信息源观察面板｜{html.escape(date_text)} 自动日报</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>VPN 信息源观察日报</title>
 <style>
-:root{{--bg:#f6f7fb;--panel:#fff;--ink:#14213d;--muted:#64748b;--line:#e5e7eb;--brand:#2447f9;--brand2:#00a896;--warn:#f59e0b;--danger:#ef4444;--soft:#eef2ff;--shadow:0 16px 40px rgba(15,23,42,.08);--radius:20px}}
-*{{box-sizing:border-box}} body{{margin:0;background:linear-gradient(180deg,#edf2ff 0,#f8fafc 280px,var(--bg) 100%);color:var(--ink);font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",Arial,sans-serif}}
-a{{color:var(--brand);text-decoration:none}} a:hover{{text-decoration:underline}}
-header,main,footer{{max-width:1440px;margin:auto}} header{{padding:32px 32px 18px}} main{{padding:0 32px 48px;display:grid;gap:22px}} footer{{padding:0 32px 36px;color:var(--muted)}}
-.hero{{display:grid;grid-template-columns:1.45fr .95fr;gap:22px}} .hero-main,.hero-side,.panel,.card{{background:rgba(255,255,255,.94);border:1px solid rgba(148,163,184,.25);border-radius:var(--radius);box-shadow:var(--shadow)}}
-.hero-main{{padding:30px;position:relative;overflow:hidden}} .hero-main:after{{content:"";position:absolute;right:-110px;top:-120px;width:280px;height:280px;border-radius:50%;background:radial-gradient(circle,rgba(36,71,249,.20),transparent 70%)}}
-h1{{font-size:32px;line-height:1.16;margin:0 0 10px;letter-spacing:-.02em}} h2{{font-size:22px;margin:0 0 18px}} h3{{font-size:17px;margin:8px 0}}
-.subtitle{{color:var(--muted);max-width:860px;margin:0}} .hero-side{{padding:20px;display:grid;grid-template-columns:1fr 1fr;gap:12px}}
-.kpi{{background:#fff;border:1px solid var(--line);border-radius:16px;padding:14px}} .kpi b{{display:block;font-size:28px;line-height:1;color:var(--brand);margin-bottom:6px}} .kpi span{{color:var(--muted)}}
-.controls{{max-width:1440px;margin:0 auto 20px;padding:0 32px;display:flex;gap:12px;flex-wrap:wrap;align-items:center}}
-.control{{border:1px solid var(--line);background:white;border-radius:999px;padding:9px 14px;box-shadow:0 6px 20px rgba(15,23,42,.04)}} input.control{{min-width:280px;outline:none}} select.control,button.control{{outline:none;cursor:pointer}}
-.grid-3{{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}} .grid-2{{display:grid;grid-template-columns:1.05fr .95fr;gap:20px}} .panel{{padding:22px}}
-.card{{padding:18px;display:flex;flex-direction:column;gap:9px}} .card-top{{display:flex;align-items:center;gap:8px;flex-wrap:wrap}}
-.pill{{display:inline-flex;align-items:center;border-radius:999px;padding:3px 9px;font-size:12px;font-weight:700;background:#e2e8f0;color:#334155}} .p0{{background:#fee2e2;color:#b91c1c}} .p1{{background:#fef3c7;color:#92400e}} .p2{{background:#dcfce7;color:#166534}}
-.theme{{font-size:12px;color:var(--muted)}} .score{{margin-left:auto;font-weight:700;color:var(--brand2);font-size:13px}} .evidence{{margin:0;color:#334155}} .audience{{margin:0;color:#475569}}
-.scores{{display:grid;gap:6px}} .scores label{{display:grid;grid-template-columns:78px 1fr;gap:8px;align-items:center;color:var(--muted);font-size:12px}}
-.bar{{display:grid;grid-template-columns:1fr 34px;gap:8px;align-items:center}} .bar:before{{content:"";height:8px;background:#e5e7eb;border-radius:999px;grid-column:1;grid-row:1}} .bar i{{display:block;height:8px;background:linear-gradient(90deg,var(--brand),var(--brand2));border-radius:999px;grid-column:1;grid-row:1}} .bar b{{font-size:12px;color:#475569}}
-.action{{margin:0;padding:10px 12px;border-radius:12px;background:#f8fafc;color:#334155}} .tags{{display:flex;flex-wrap:wrap;gap:6px;margin-top:auto}} .tags span{{font-size:12px;background:#eef2ff;color:#3730a3;border-radius:999px;padding:3px 8px}}
-.action-card{{border:1px solid var(--line);border-radius:16px;background:#fff;padding:14px;margin-bottom:10px}} .action-card p{{margin:8px 0 4px}} .action-card small{{color:var(--muted)}} details{{font-size:12px;color:#475569}} details ul{{padding-left:18px}}
-.table-wrap{{overflow:auto;border:1px solid var(--line);border-radius:16px}} table{{width:100%;border-collapse:collapse;background:white}} th,td{{border-bottom:1px solid var(--line);padding:10px 11px;text-align:left;vertical-align:top}} th{{background:#f8fafc;color:#475569;font-size:12px;text-transform:uppercase;letter-spacing:.02em}} td{{font-size:13px}} tr:hover td{{background:#fafafa}} small{{color:var(--muted)}} tr.failed td{{background:#fff7f7}} tr.limited td{{background:#fffbeb}} tr.partial td{{background:#f0fdf4}}
-.notice{{border-left:4px solid var(--warn);background:#fffbeb;padding:12px 14px;border-radius:12px;color:#92400e}} .source-list{{columns:2}} .source-list li{{break-inside:avoid;margin:4px 0}}
-@media(max-width:980px){{.hero,.grid-2,.grid-3{{grid-template-columns:1fr}} header,main,footer,.controls{{padding-left:16px;padding-right:16px}}}}
+:root {{ --bg:#08111f; --panel:#111c35; --panel2:#0c1628; --line:#22314f; --text:#e5eefb; --muted:#94a3b8; --accent:#60a5fa; --good:#34d399; --warn:#fbbf24; --bad:#fb7185; }}
+* {{ box-sizing:border-box; }} body {{ margin:0; background:linear-gradient(180deg,#08111f,#0b1324 46%,#0f172a); color:var(--text); font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Noto Sans SC','PingFang SC',Arial,sans-serif; }}
+a {{ color:#93c5fd; text-decoration:none; }} a:hover {{ text-decoration:underline; }} header,main {{ width:min(1240px,94vw); margin:auto; }} header {{ padding:38px 0 24px; }} .kicker {{ color:var(--good); font-size:13px; letter-spacing:.14em; text-transform:uppercase; }} h1 {{ margin:10px 0; font-size:38px; }} h2 {{ margin:0 0 14px; font-size:22px; }} h3 {{ margin:12px 0 10px; font-size:19px; line-height:1.45; }} h4 {{ margin:15px 0 8px; font-size:14px; color:#dbeafe; }} .lead {{ color:#cbd5e1; max-width:980px; line-height:1.7; }} .notice {{ background:#172554; border:1px solid #2a4b8d; padding:12px 14px; border-radius:14px; color:#dbeafe; margin-top:14px; }}
+.grid {{ display:grid; gap:16px; }} .stats {{ grid-template-columns:repeat(6,1fr); margin:18px 0 28px; }} .stat,.card,.panel,.taxonomy {{ background:rgba(17,28,53,.88); border:1px solid var(--line); border-radius:18px; box-shadow:0 18px 60px rgba(0,0,0,.18); }} .stat {{ padding:16px; }} .stat b {{ display:block; font-size:26px; color:#fff; }} .stat span {{ color:var(--muted); font-size:13px; }} .section {{ margin:22px 0; }} .taxgrid {{ grid-template-columns:repeat(5,1fr); }} .taxonomy {{ padding:15px; }} .taxHead {{ display:flex; justify-content:space-between; gap:10px; align-items:center; }} .taxonomy p {{ color:#dbeafe; line-height:1.55; min-height:74px; }} .taxonomy small {{ color:var(--muted); line-height:1.5; display:block; }} .taxNums {{ display:flex; gap:7px; flex-wrap:wrap; margin-top:12px; }} .taxNums i {{ font-style:normal; background:#0c1628; border:1px solid var(--line); border-radius:999px; padding:4px 8px; color:#cbd5e1; font-size:12px; }}
+.findings {{ grid-template-columns:repeat(2,1fr); }} .card {{ padding:18px; }} .card.p0 {{ border-color:#f59e0b; }} .card.p1 {{ border-color:#60a5fa; }} .meta,.tags {{ display:flex; flex-wrap:wrap; gap:7px; }} .pill,.tags span {{ background:#0c1628; border:1px solid var(--line); color:#cbd5e1; border-radius:999px; padding:5px 9px; font-size:12px; }} .pill.p0 {{ background:rgba(251,191,36,.18); border-color:#f59e0b; color:#fde68a; }} .pill.p1 {{ background:rgba(96,165,250,.16); border-color:#3b82f6; color:#bfdbfe; }} .pill.p2 {{ background:rgba(52,211,153,.14); border-color:#10b981; color:#bbf7d0; }} .card p {{ line-height:1.65; color:#dbeafe; }} .sourceList {{ padding-left:22px; margin:8px 0 0; }} .sourceList li {{ margin:8px 0; line-height:1.45; }} .sourceList small {{ display:block; color:var(--muted); margin-top:3px; }}
+.two {{ grid-template-columns:.8fr 1.2fr; }} .panel {{ padding:18px; overflow:auto; }} table {{ width:100%; border-collapse:collapse; }} th,td {{ text-align:left; vertical-align:top; padding:12px; border-bottom:1px solid var(--line); }} th {{ color:#dbeafe; font-size:13px; }} td {{ color:#cbd5e1; font-size:13px; line-height:1.55; }} td small {{ display:block; color:var(--muted); margin-top:5px; }} .keywords {{ display:flex; flex-wrap:wrap; gap:8px; }} .keywords span {{ background:#0c1628; border:1px solid var(--line); color:#cbd5e1; border-radius:999px; padding:6px 10px; font-size:12px; }} .empty {{ padding:22px; border:1px dashed #334155; border-radius:16px; color:#cbd5e1; background:#0c1628; }} .muted,.footer {{ color:var(--muted); }} .footer {{ font-size:12px; margin:28px 0 40px; line-height:1.7; }}
+@media (max-width: 1100px) {{ .stats,.taxgrid {{ grid-template-columns:repeat(2,1fr); }} .findings,.two {{ grid-template-columns:1fr; }} }} @media (max-width: 680px) {{ .stats,.taxgrid {{ grid-template-columns:1fr; }} h1 {{ font-size:28px; }} }}
 </style>
 </head>
 <body>
 <header>
-  <div class="hero">
-    <section class="hero-main">
-      <h1>VPN UK 信息源观察面板</h1>
-      <p class="subtitle">自动日报版。按“最重要、受众最关切、行业最相关、增长需求点”聚合公开来源、社区、媒体评测、搜索/应用商店信号。生成时间：{html.escape(generated)}</p>
-    </section>
-    <aside class="hero-side">
-      <div class="kpi"><b>{stats.get("raw_items",0)}</b><span>今日抓取条目</span></div>
-      <div class="kpi"><b>{stats.get("fetched_sources",0)}</b><span>成功来源</span></div>
-      <div class="kpi"><b>{stats.get("limited_sources",0)}</b><span>受限来源</span></div>
-      <div class="kpi"><b>{len(findings)}</b><span>重点判断</span></div>
-    </aside>
-  </div>
+  <div class="kicker">Daily Source Intelligence Panel · v3</div>
+  <h1>VPN 信息源观察日报</h1>
+  <div class="lead">面板只展示最近 {esc(stats.get('freshness_hours', FRESHNESS_HOURS))} 小时内、能确认发布时间的信息；无法确认发布时间或超过窗口的信息不会进入重点卡。多个来源反映同一件事时，合并成一个统一要点，并在要点后附全部原始链接。</div>
+  <div class="lead">更新时间：{generated_at}</div>
+  <div class="notice">时效窗口：{esc(window_text)}。Reddit 状态：{esc(reddit_note)}。社媒状态：{esc(x_note)}</div>
 </header>
-
-<div class="controls">
-  <input id="searchBox" class="control" placeholder="搜索主题 / 来源 / 竞品 / 场景…" />
-  <select id="priorityFilter" class="control"><option value="all">全部优先级</option><option value="P0">P0</option><option value="P1">P1</option><option value="P2">P2</option></select>
-  <select id="tierFilter" class="control"><option value="all">全部来源层级</option><option>核心日报源</option><option>周更重点源</option><option>观察池</option></select>
-  <button class="control" onclick="downloadJSON()">下载今日 JSON</button>
-</div>
-
 <main>
-  <section class="panel">
-    <h2>今日重点判断</h2>
-    <div class="grid-3">{"".join(finding_cards)}</div>
+  <section class="grid stats">{stat_cards}</section>
+
+  <section class="section">
+    <h2>5 类信息源分类</h2>
+    <div class="grid taxgrid">{category_cards}</div>
   </section>
 
-  <section class="grid-2">
-    <div class="panel">
-      <h2>信号热度矩阵</h2>
-      <div class="table-wrap"><table><thead><tr><th>信号</th><th>热度</th><th>置信</th><th>趋势</th><th>建议 Owner</th><th>条目数</th></tr></thead><tbody>{"".join(signal_rows)}</tbody></table></div>
-    </div>
-    <div class="panel">
-      <h2>增长行动板</h2>
-      {"".join(action_cards)}
-    </div>
+  <section class="section">
+    <h2>当前有效信息要点</h2>
+    <div class="grid findings">{finding_cards}</div>
   </section>
 
-  <section class="panel">
-    <h2>原始条目池</h2>
-    <div class="table-wrap"><table id="rawTable"><thead><tr><th>来源</th><th>平台</th><th>标题/摘要</th><th>主题</th><th>来源权重</th></tr></thead><tbody>{"".join(raw_rows)}</tbody></table></div>
-  </section>
-
-  <section class="grid-2">
+  <section class="section grid two">
     <div class="panel">
-      <h2>抓取健康度</h2>
-      <div class="table-wrap"><table><thead><tr><th>来源</th><th>平台</th><th>状态</th><th>条目</th><th>耗时 ms</th><th>备注</th></tr></thead><tbody>{"".join(health_rows)}</tbody></table></div>
+      <h2>高频关键词</h2>
+      <div class="keywords">{keywords_html}</div>
     </div>
     <div class="panel">
-      <h2>受限与人工补充</h2>
-      <p class="notice">X/TikTok/Discord/部分搜索和商店评论可能需要 API、登录权限或第三方监听工具。脚本会自动保留受限说明，不会中断日报生成。</p>
-      <ul>{"".join(limitation_rows)}</ul>
+      <h2>时效过滤说明</h2>
+      <p class="lead">被过滤的信息不会出现在日报重点里，原因通常是发布时间超过窗口，或网页没有可验证发布时间。</p>
+      <table><thead><tr><th>过滤原因</th><th>数量</th></tr></thead><tbody>{filtered_rows}</tbody></table>
     </div>
   </section>
 
-  <section class="panel">
-    <h2>来源池</h2>
-    <div class="table-wrap"><table id="sourceTable"><thead><tr><th>类别</th><th>平台</th><th>来源</th><th>入口</th><th>频率</th><th>层级</th><th>优先级</th><th>备注</th></tr></thead><tbody>{"".join(source_rows)}</tbody></table></div>
+  <section class="section panel">
+    <h2>当前原始信息列表</h2>
+    <table><thead><tr><th>信息</th><th>来源/方法</th><th>分类/子分类</th><th>时效</th><th>优先级</th></tr></thead><tbody>{item_rows}</tbody></table>
   </section>
 
-  <section class="panel">
+  <section class="section panel">
+    <h2>受限/失败来源与处理方式</h2>
+    <table><thead><tr><th>来源</th><th>状态/方法</th><th>原因</th><th>处理</th></tr></thead><tbody>{limitation_rows}</tbody></table>
+  </section>
+
+  <section class="section panel">
+    <h2>信息源池</h2>
+    <table><thead><tr><th>来源</th><th>分类</th><th>平台</th><th>频率</th><th>层级</th><th>采集策略</th></tr></thead><tbody>{source_rows}</tbody></table>
+  </section>
+
+  <section class="section panel">
     <h2>证据来源索引</h2>
-    <ol class="source-list">{"".join(citations)}</ol>
+    <table><thead><tr><th>来源链接</th><th>分类</th><th>URL</th></tr></thead><tbody>{link_rows}</tbody></table>
   </section>
+
+  <div class="footer">说明：日报面板按来源类型分类，而不是按观点分类。社媒平台、Reddit、应用商店和部分搜索页可能需要 API、登录或手工补充；系统默认不把无法确认日期的内容放入重点，以避免旧信息污染日报。</div>
 </main>
-
-<footer>
-  <p>自动更新机制：GitHub Actions 每天按 UTC cron 运行脚本，脚本生成静态 HTML/JSON 并提交到仓库，GitHub Pages 从 docs 目录发布。</p>
-</footer>
-
-<script>
-const DATA = {j};
-function applyFilters() {{
-  const q = document.getElementById('searchBox').value.trim().toLowerCase();
-  const p = document.getElementById('priorityFilter').value;
-  const t = document.getElementById('tierFilter').value;
-  document.querySelectorAll('.finding').forEach(card => {{
-    const okP = p === 'all' || card.dataset.priority === p;
-    const okQ = !q || card.dataset.search.includes(q);
-    card.style.display = (okP && okQ) ? '' : 'none';
-  }});
-  document.querySelectorAll('#sourceTable tbody tr').forEach(row => {{
-    const okT = t === 'all' || row.dataset.tier === t;
-    const okQ = !q || row.dataset.search.includes(q);
-    row.style.display = (okT && okQ) ? '' : 'none';
-  }});
-  document.querySelectorAll('#rawTable tbody tr').forEach(row => {{
-    const okQ = !q || row.dataset.search.includes(q);
-    row.style.display = okQ ? '' : 'none';
-  }});
-}}
-document.getElementById('searchBox').addEventListener('input', applyFilters);
-document.getElementById('priorityFilter').addEventListener('change', applyFilters);
-document.getElementById('tierFilter').addEventListener('change', applyFilters);
-function downloadJSON() {{
-  const blob = new Blob([JSON.stringify(DATA, null, 2)], {{type:'application/json;charset=utf-8'}});
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url; a.download = 'vpn_source_observation_data_' + DATA.date + '.json'; a.click();
-  URL.revokeObjectURL(url);
-}}
-</script>
 </body>
 </html>"""
-    return html_doc
 
 
-def render_markdown_report(data: Dict[str, Any]) -> str:
-    lines = []
-    lines.append(f"# VPN UK 信息源自动日报｜{data.get('date')}")
-    lines.append("")
-    lines.append(f"生成时间：{data.get('generated_at')}")
-    lines.append("")
-    lines.append("## 今日重点")
-    for f in data.get("findings", [])[:8]:
-        lines.append(f"- **{f.get('priority')}｜{f.get('theme')}**：{f.get('title')}")
-        lines.append(f"  - 证据：{f.get('evidence')}")
-        lines.append(f"  - 动作：{f.get('action')}")
-    lines.append("")
-    lines.append("## 信号热度")
-    for s in data.get("signals", [])[:10]:
-        lines.append(f"- {s.get('name')}：热度 {s.get('heat')}，置信 {s.get('confidence')}，趋势 {s.get('direction')}，Owner {s.get('owner')}")
-    lines.append("")
-    lines.append("## 来源健康度")
-    st = data.get("stats", {})
-    lines.append(f"- 成功来源：{st.get('fetched_sources')}；部分可用：{st.get('partial_sources')}；受限：{st.get('limited_sources')}；失败：{st.get('failed_sources')}；原始条目：{st.get('raw_items')}")
-    lines.append("")
-    lines.append("## 受限说明")
-    for l in data.get("limitations", [])[:12]:
-        lines.append(f"- {l.get('source')}：{l.get('status')} — {l.get('note')}")
-    lines.append("")
-    return "\n".join(lines)
+def write_markdown_report(data: Dict[str, Any], path: Path) -> None:
+    lines = [
+        f"# VPN 信息源观察日报 - {data.get('date')}",
+        "",
+        f"生成时间：{data.get('generated_at')}",
+        "",
+        "## 时效规则",
+        "- 只展示当前窗口内、能确认发布时间的信息。",
+        "- 默认所有类别只展示最近 36 小时内且能确认发布时间的信息；可在 GitHub Actions 变量中覆盖 DASHBOARD_LOOKBACK_HOURS。",
+        "",
+        "## 当前有效信息要点",
+    ]
+    for f in data.get("findings", []):
+        lines.extend([
+            "",
+            f"### {f.get('priority')}｜{f.get('category')}｜{f.get('subcategory')}",
+            f"- 要点：{f.get('evidence')}",
+            f"- 时效：{f.get('freshness')}",
+            "- 原始来源：",
+        ])
+        for link in f.get("source_links", []):
+            lines.append(f"  - {link.get('source')}｜{link.get('published_at')}｜{link.get('title')}：{link.get('url')}")
+    if not data.get("findings"):
+        lines.append("当前时效窗口内没有抓到可确认发布时间的新信息。")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def dedupe_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    seen = set()
-    output = []
-    for it in items:
-        key = it.get("url") or (it.get("source", "") + "|" + it.get("title", ""))
-        if key in seen:
-            continue
-        seen.add(key)
-        output.append(it)
-    return output
+def main() -> int:
+    start = time.time()
+    today_dt = now_sg()
+    today = today_dt.date()
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    STATUS_DIR.mkdir(parents=True, exist_ok=True)
 
+    sources = read_csv_dicts(SOURCES_CSV)
+    source_lookup = {s.get("来源名称", ""): s for s in sources}
+    monitored = [s for s in sources if include_source(s)][:MAX_SOURCES_PER_RUN]
 
-def run(offline: bool = False, full_scan: bool = False) -> Dict[str, Any]:
-    ensure_dirs()
-    generated_at = now_sg()
-    today = generated_at.date()
-    seed = load_seed()
-    sources = load_sources()
-    previous = {}
-    latest_path = DATA_DIR / "latest.json"
-    if latest_path.exists():
+    raw_items: List[Dict[str, Any]] = []
+    statuses: List[Dict[str, Any]] = []
+
+    def fetch_one(row: Dict[str, str]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        name = row.get("来源名称", "未知来源")
         try:
-            previous = json.loads(latest_path.read_text(encoding="utf-8"))
-        except Exception:
-            previous = {}
+            fetched, status = fetch_web(row)
+            status.update({"source_name": name, "platform": row.get("平台", ""), "url": row.get("URL/入口", ""), "intelligence_category": source_taxonomy(row)})
+            for it in fetched:
+                it.setdefault("source_name", name)
+            return fetched, status
+        except Exception as exc:
+            return [], {"source_name": name, "status": "failed", "reason": str(exc)[:260], "trace": traceback.format_exc()[:1200], "intelligence_category": source_taxonomy(row)}
 
-    all_items: List[Dict[str, Any]] = []
-    fetch_results: List[FetchResult] = []
+    if monitored:
+        with ThreadPoolExecutor(max_workers=max(1, MAX_WORKERS)) as pool:
+            future_map = {pool.submit(fetch_one, row): row for row in monitored}
+            for future in as_completed(future_map):
+                fetched, status = future.result()
+                statuses.append(status)
+                raw_items.extend(fetched)
 
-    manual_items = load_manual_items(today)
+    manual_items = read_manual_inputs(today)
     if manual_items:
-        all_items.extend(manual_items)
-        fetch_results.append(
-            FetchResult(
-                source_name="手工补充",
-                platform="Manual",
-                url=str(CONFIG_DIR / "manual_inputs.csv"),
-                status="fetched",
-                item_count=len(manual_items),
-                note="已纳入 config/manual_inputs.csv 中当天或无日期的手工信号",
-                elapsed_ms=0,
-            )
-        )
+        statuses.append({"source_name": "manual_inputs.csv", "status": "ok", "fetched": len(manual_items), "method": "manual"})
+        raw_items.extend(manual_items)
 
-    for source in sources:
-        due = should_fetch_source(source, today, full_scan=full_scan)
-        if offline:
-            due = False
-        if not due:
-            fetch_results.append(
-                FetchResult(
-                    source_name=source.get("来源名称", ""),
-                    platform=source.get("平台", ""),
-                    url=source.get("URL/入口", ""),
-                    status="skipped",
-                    item_count=0,
-                    note="未到该来源追踪频率",
-                    elapsed_ms=0,
-                )
-            )
-            continue
-        items, result = fetch_source(source)
-        fetch_results.append(result)
-        all_items.extend(items)
+    raw_items = dedupe_items(raw_items)
+    enriched = [enrich_item(it, source_lookup) for it in raw_items]
+    current_items, filtered_items = filter_current_items(enriched, today_dt)
+    current_items.sort(key=lambda x: (TAXONOMY_ORDER.index(x.get("intelligence_category")) if x.get("intelligence_category") in TAXONOMY_ORDER else 99, -int(x.get("importance_score", 0))), reverse=False)
 
-    all_items = dedupe_items(all_items)
+    findings = build_findings(current_items)
+    category_panels = build_category_panels(current_items, sources)
+    stats = build_stats(sources, current_items, enriched, filtered_items, statuses)
+    limitations = build_limitations(statuses, filtered_items)
+    filtered_items_public = sanitize_filtered_items(filtered_items)
 
-    data = make_fallback_dashboard(
-        items=all_items,
-        sources=sources,
-        fetch_results=fetch_results,
-        previous=previous,
-        generated_at=generated_at,
-        seed=seed,
-    )
-    data = try_llm_enhance(data)
+    data = {
+        "date": today.isoformat(),
+        "generated_at": today_dt.strftime("%Y-%m-%d %H:%M:%S Asia/Singapore"),
+        "stats": stats,
+        "taxonomy": TAXONOMY,
+        "category_panels": category_panels,
+        "findings": findings,
+        "items": current_items[:180],
+        "filtered_items": filtered_items_public[:180],
+        "limitations": limitations,
+        "sources": sources,
+        "source_statuses": statuses,
+        "citation_links": citation_links(findings, current_items),
+        "keyword_cloud": keyword_cloud(current_items),
+        "runtime_seconds": round(time.time() - start, 2),
+    }
 
-    html_doc = render_html(data)
-    (DOCS_DIR / "index.html").write_text(html_doc, encoding="utf-8")
-    latest_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    (ARCHIVE_DIR / f"{data['date']}.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    (REPORTS_DIR / f"{data['date']}.md").write_text(render_markdown_report(data), encoding="utf-8")
+    (DATA_DIR / "latest.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    (ARCHIVE_DIR / f"{today.isoformat()}.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    (DOCS_DIR / "index.html").write_text(render_html(data), encoding="utf-8")
+    write_markdown_report(data, REPORT_DIR / f"{today.isoformat()}.md")
     (STATUS_DIR / "last_run.json").write_text(
         json.dumps(
             {
-                "generated_at": data.get("generated_at"),
-                "date": data.get("date"),
-                "stats": data.get("stats"),
-                "method": data.get("method"),
+                "date": today.isoformat(),
+                "generated_at": data["generated_at"],
+                "ok": True,
+                "stats": stats,
+                "runtime_seconds": data["runtime_seconds"],
+                "reddit_oauth_ready": stats["reddit_oauth_ready"],
             },
             ensure_ascii=False,
             indent=2,
         ),
         encoding="utf-8",
     )
-    return data
-
-
-def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Generate the daily VPN source observation dashboard.")
-    parser.add_argument("--offline", action="store_true", help="Do not fetch the web; use seed/fallback content. Useful for testing.")
-    parser.add_argument("--full-scan", action="store_true", help="Ignore source frequency and scan every configured source.")
-    args = parser.parse_args(argv)
-    data = run(offline=args.offline, full_scan=args.full_scan)
-    print(json.dumps({"ok": True, "date": data.get("date"), "stats": data.get("stats")}, ensure_ascii=False))
+    print(f"Generated dashboard v3 with {len(current_items)} current items, {len(filtered_items)} filtered items, from {len(monitored)} monitored sources.")
     return 0
 
 

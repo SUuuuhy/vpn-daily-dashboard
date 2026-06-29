@@ -1,29 +1,34 @@
 {
-  "generated_at": "2026-06-29 14:48 Asia/Singapore",
   "date": "2026-06-29",
+  "generated_at": "2026-06-29 17:01:52 Asia/Singapore",
+  "ok": true,
   "stats": {
-    "total_sources": 49,
-    "due_sources": 49,
-    "fetched_sources": 0,
-    "partial_sources": 0,
-    "limited_sources": 0,
-    "failed_sources": 0,
-    "skipped_sources": 49,
+    "total_sources": 99,
+    "monitored_sources": 80,
+    "current_items": 0,
     "raw_items": 0,
-    "candidate": 28,
-    "sustainable": 28,
-    "daily": 5,
-    "weekly": 19,
-    "monthly": 8,
-    "low": 17
+    "filtered_items": 0,
+    "sources_ok": 0,
+    "sources_limited": 80,
+    "sources_failed": 0,
+    "reddit_oauth_ready": false,
+    "x_api_ready": false,
+    "freshness_windows": {
+      "竞品动态": "36小时",
+      "社交媒体": "36小时",
+      "reddit讨论": "36小时",
+      "政策风险": "36小时",
+      "第三方网站": "36小时"
+    },
+    "freshness_hours": 36,
+    "freshness_days": {
+      "竞品动态": 1.5,
+      "社交媒体": 1.5,
+      "reddit讨论": 1.5,
+      "政策风险": 1.5,
+      "第三方网站": 1.5
+    }
   },
-  "method": {
-    "summary": "公开来源自动抓取 + 规则打分；若配置 OPENAI_API_KEY 且 OPENAI_MODEL 可启用 LLM 二次整合。",
-    "principles": [
-      "最重要",
-      "受众最关切",
-      "行业最相关",
-      "增长需求点"
-    ]
-  }
+  "runtime_seconds": 0.01,
+  "reddit_oauth_ready": false
 }
